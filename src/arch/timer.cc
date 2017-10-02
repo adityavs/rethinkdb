@@ -1,6 +1,8 @@
 // Copyright 2010-2014 RethinkDB, all rights reserved.
 #include "arch/timer.hpp"
 
+#include <algorithm>
+
 #include "arch/runtime/thread_pool.hpp"
 #include "time.hpp"
 #include "utils.hpp"
@@ -9,7 +11,7 @@ class timer_token_t : public intrusive_priority_queue_node_t<timer_token_t> {
     friend class timer_handler_t;
 
 private:
-    timer_token_t() : interval_nanos(-1), next_time_in_nanos(-1), callback(NULL) { }
+    timer_token_t() : interval_nanos(-1), next_time_in_nanos(-1), callback(nullptr) { }
 
     friend bool left_is_higher_priority(const timer_token_t *left, const timer_token_t *right);
 
@@ -43,7 +45,7 @@ void timer_handler_t::on_oneshot() {
     // If the timer_provider tends to return its callback a touch early, we don't want to make a
     // bunch of calls to it, returning a tad early over and over again, leading up to a ticks
     // threshold.  So we bump the real time up to the threshold when processing the priority queue.
-    int64_t real_ticks = get_ticks();
+    int64_t real_ticks = get_ticks().nanos;
     int64_t ticks = std::max(real_ticks, expected_oneshot_time_in_nanos);
 
     while (!token_queue.empty() && token_queue.peek()->next_time_in_nanos <= ticks) {
@@ -74,7 +76,7 @@ timer_token_t *timer_handler_t::add_timer_internal(const int64_t ms, timer_callb
     const int64_t nanos = ms * MILLION;
     rassert(nanos > 0);
 
-    const int64_t next_time_in_nanos = get_ticks() + nanos;
+    const int64_t next_time_in_nanos = get_ticks().nanos + nanos;
 
     timer_token_t *const token = new timer_token_t;
     token->interval_nanos = once ? 0 : nanos;
@@ -84,7 +86,7 @@ timer_token_t *timer_handler_t::add_timer_internal(const int64_t ms, timer_callb
     const timer_token_t *top_entry = token_queue.peek();
     token_queue.push(token);
 
-    if (top_entry == NULL || next_time_in_nanos < top_entry->next_time_in_nanos) {
+    if (top_entry == nullptr || next_time_in_nanos < top_entry->next_time_in_nanos) {
         timer_provider.schedule_oneshot(next_time_in_nanos, this);
     }
 

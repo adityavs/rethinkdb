@@ -11,6 +11,7 @@
 #include "extproc/http_runner.hpp"
 #include "logger.hpp"
 #include "rdb_protocol/env.hpp"
+#include "rdb_protocol/pseudo_time.hpp"
 
 namespace ql {
 void dispatch_http(ql::env_t *env,
@@ -32,26 +33,29 @@ version_checker_t::version_checker_t(
     table_meta_client(_table_meta_client),
     server_config_client(_server_config_client),
     timer(day_in_ms, this) {
-    rassert(rdb_ctx != NULL);
+    rassert(rdb_ctx != nullptr);
     coro_t::spawn_sometime(std::bind(&version_checker_t::do_check,
                                      this, true, drainer.lock()));
 }
 
 void version_checker_t::do_check(bool is_initial, auto_drainer_t::lock_t keepalive) {
-    ql::env_t env(rdb_ctx,
-                  ql::return_empty_normal_batches_t::NO,
-                  keepalive.get_drain_signal(),
-                  std::map<std::string, ql::wire_func_t>(),
-                  nullptr);
+    ql::env_t env(
+        rdb_ctx,
+        ql::return_empty_normal_batches_t::NO,
+        keepalive.get_drain_signal(),
+        ql::global_optargs_t(),
+        auth::user_context_t(auth::permissions_t(tribool::False, tribool::False, tribool::False, tribool::True)),
+        ql::datum_t(),
+        nullptr);
     http_opts_t opts;
     opts.limits = env.limits();
     opts.result_format = http_result_format_t::JSON;
     if (is_initial) {
-        opts.url = strprintf("http://update.rethinkdb.com/update_for/%s",
+        opts.url = strprintf("https://update.rethinkdb.com/update_for/%s",
                              RETHINKDB_VERSION);
     } else {
         opts.method = http_method_t::POST;
-        opts.url = "http://update.rethinkdb.com/checkin";
+        opts.url = "https://update.rethinkdb.com/checkin";
         opts.header.push_back("Content-Type: application/x-www-form-urlencoded");
         opts.form_data["Version"] = RETHINKDB_VERSION;
         opts.form_data["Uname"] = uname;
@@ -110,10 +114,10 @@ size_t version_checker_t::count_tables() {
 }
 
 void version_checker_t::process_result(const http_result_t &result) {
-    rcheck_datum(result.error.empty(), ql::base_exc_t::GENERIC,
-        strprintf("protocol error: %s", result.error.c_str()));
-    rcheck_datum(result.body.has(), ql::base_exc_t::GENERIC,
-        "no body returned");
+    rcheck_datum(result.error.empty(), ql::base_exc_t::LOGIC,
+                 strprintf("protocol error: %s", result.error.c_str()));
+    rcheck_datum(result.body.has(), ql::base_exc_t::LOGIC,
+                 "no body returned");
 
     ql::datum_t status = result.body.get_field("status", ql::THROW);
     const datum_string_t &str = status.as_str();
@@ -122,8 +126,8 @@ void version_checker_t::process_result(const http_result_t &result) {
             "running the most up-to-date version.");
     } else if (str == "error") {
         ql::datum_t reason = result.body.get_field("error", ql::THROW);
-        rfail_datum(ql::base_exc_t::GENERIC,
-            "update server reports error: %s", reason.as_str().to_std().c_str());
+        rfail_datum(ql::base_exc_t::LOGIC,
+                    "update server reports error: %s", reason.as_str().to_std().c_str());
     } else if (str == "need_update") {
         ql::datum_t new_version_datum = result.body.get_field("last_version", ql::THROW);
         datum_string_t new_version = new_version_datum.as_str();
@@ -144,6 +148,6 @@ void version_checker_t::process_result(const http_result_t &result) {
                 "are available since we last checked.");
         }
     } else {
-        rfail_datum(ql::base_exc_t::GENERIC, "unexpected status code");
+        rfail_datum(ql::base_exc_t::LOGIC, "unexpected status code");
     }
 }

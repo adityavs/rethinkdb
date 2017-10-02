@@ -10,7 +10,7 @@
 #include "btree/types.hpp"
 #include "concurrency/promise.hpp"
 #include "rdb_protocol/btree.hpp"
-#include "rdb_protocol/lazy_json.hpp"
+#include "rdb_protocol/lazy_btree_val.hpp"
 #include "rdb_protocol/store.hpp"
 
 class collect_keys_helper_t : public depth_first_traversal_callback_t {
@@ -146,7 +146,7 @@ continue_bool_t rdb_erase_small_range(
                                   repli_timestamp_t::invalid /* ignored for erase */,
                                   deletion_context->in_tree_deleter(),
                                   &null_cb,
-                                  delete_or_erase_t::ERASE);
+                                  delete_mode_t::ERASE);
         } // kv_location is destroyed here. That's important because sometimes
           // pass_back_superblock_promise isn't pulsed before the kv_location
           // gets deleted.

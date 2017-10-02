@@ -6,6 +6,7 @@
 #include "clustering/generic/registration_metadata.hpp"
 #include "clustering/immediate_consistency/backfill_item_seq.hpp"
 #include "clustering/immediate_consistency/history.hpp"
+#include "rdb_protocol/distribution_progress.hpp"
 #include "rdb_protocol/protocol.hpp"
 #include "rpc/mailbox/typed.hpp"
 
@@ -33,16 +34,6 @@ public:
     /* The maximum size, in bytes, of a chunk of pre-items sent over the network from the
     backfillee to the backfiller. */
     size_t pre_item_chunk_mem_size;
-
-    /* The maximum number of writes that the `remote_replicator_client_t` will allow to
-    queue up before it pauses the backfill to perform the writes */
-    size_t write_queue_count;
-
-    /* Every time the `remote_replicator_client_t` performs a queued write, it allows
-    `write_queue_trickle_fraction` new writes to be added to the back of the queue. So
-    this must be between 0 and 1. Higher values improve streaming write performance, but
-    make the backfill take longer. */
-    double write_queue_trickle_fraction;
 };
 
 RDB_DECLARE_SERIALIZABLE(backfill_config_t);
@@ -131,61 +122,73 @@ public:
     Sometimes this isn't strictly necessary, since sometimes messages can be reordered
     without breaking anything; but it makes things simpler. */
 
-    typedef mailbox_t<void(
+    typedef mailbox_t<
         fifo_enforcer_write_token_t,
         backfill_item_seq_t<backfill_pre_item_t>
-        )> pre_items_mailbox_t;
+        > pre_items_mailbox_t;
 
-    typedef mailbox_t<void(
+    typedef mailbox_t<
         fifo_enforcer_write_token_t,
         key_range_t::right_bound_t
-        )> begin_session_mailbox_t;
+        > begin_session_mailbox_t;
 
-    typedef mailbox_t<void(
+    typedef mailbox_t<
         fifo_enforcer_write_token_t
-        )> end_session_mailbox_t;
+        > end_session_mailbox_t;
 
-    typedef mailbox_t<void(
+    typedef mailbox_t<
         fifo_enforcer_write_token_t,
         /* This `size_t` has the same meaning as the numbers returned by
         `backfill_item_t::get_mem_size()`. */
         size_t
-        )> ack_items_mailbox_t;
+        > ack_items_mailbox_t;
 
     class intro_2_t {
     public:
+        /* The backfillee uses this to determine where to send pre-items from. */
         region_map_t<state_timestamp_t> common_version;
+
+        /* This is the branch history corresponding to the `version_t`s that will be sent
+        later. */
         branch_history_t final_version_history;
+
+        /* These mailboxes are used to conduct the actual backfill itself. */
         pre_items_mailbox_t::address_t pre_items_mailbox;
         begin_session_mailbox_t::address_t begin_session_mailbox;
         end_session_mailbox_t::address_t end_session_mailbox;
         ack_items_mailbox_t::address_t ack_items_mailbox;
+
+        /* This is used to determine the backfill priority. */
+        uint64_t num_changes_estimate;
+
+        /* This is used to estimate backfill progress. */
+        distribution_progress_estimator_t progress_estimator;
     };
 
-    typedef mailbox_t<void(
+    typedef mailbox_t<
         fifo_enforcer_write_token_t,
         /* The `region_map_t` and the `backfill_item_seq_t` have the same region. */
         region_map_t<version_t>,
         backfill_item_seq_t<backfill_item_t>
-        )> items_mailbox_t;
+        > items_mailbox_t;
 
-    typedef mailbox_t<void(
+    typedef mailbox_t<
         fifo_enforcer_write_token_t
-        )> ack_end_session_mailbox_t;
+        > ack_end_session_mailbox_t;
 
-    typedef mailbox_t<void(
+    typedef mailbox_t<
         fifo_enforcer_write_token_t,
         /* This `size_t` has the same meaning as the numbers returned by
         `backfill_pre_item_t::get_mem_size()`. */
         size_t
-        )> ack_pre_items_mailbox_t;
+        > ack_pre_items_mailbox_t;
 
     class intro_1_t {
     public:
         backfill_config_t config;
         region_map_t<version_t> initial_version;
         branch_history_t initial_version_history;
-        mailbox_t<void(intro_2_t)>::address_t intro_mailbox;
+        mailbox_t<intro_2_t>::address_t intro_mailbox;
         items_mailbox_t::address_t items_mailbox;
         ack_end_session_mailbox_t::address_t ack_end_session_mailbox;
         ack_pre_items_mailbox_t::address_t ack_pre_items_mailbox;
@@ -212,10 +215,10 @@ struct replica_bcard_t {
     /* This mailbox is used to ensure that the replica is at least as up to date as the
     timestamp. The second argument is used as an ack mailbox; the replica will send a
     reply there once it's at least as up to date as the timestamp. */
-    typedef mailbox_t<void(
+    typedef mailbox_t<
         state_timestamp_t,
-        mailbox_addr_t<void()>
-        )> synchronize_mailbox_t;
+        mailbox_addr_t<>
+        > synchronize_mailbox_t;
 
     synchronize_mailbox_t::address_t synchronize_mailbox;
     branch_id_t branch_id;

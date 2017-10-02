@@ -4,7 +4,6 @@
 #include "clustering/administration/servers/server_metadata.hpp"
 #include "containers/archive/archive.hpp"
 #include "containers/archive/boost_types.hpp"
-#include "containers/archive/cow_ptr_type.hpp"
 #include "containers/archive/stl_types.hpp"
 #include "containers/archive/versioned.hpp"
 #include "rdb_protocol/protocol.hpp"
@@ -14,9 +13,13 @@ RDB_IMPL_SERIALIZABLE_1_SINCE_v2_1(cluster_semilattice_metadata_t, databases);
 RDB_IMPL_SEMILATTICE_JOINABLE_1(cluster_semilattice_metadata_t, databases);
 RDB_IMPL_EQUALITY_COMPARABLE_1(cluster_semilattice_metadata_t, databases);
 
-RDB_IMPL_SERIALIZABLE_1_SINCE_v1_13(auth_semilattice_metadata_t, auth_key);
-RDB_IMPL_SEMILATTICE_JOINABLE_1(auth_semilattice_metadata_t, auth_key);
-RDB_IMPL_EQUALITY_COMPARABLE_1(auth_semilattice_metadata_t, auth_key);
+RDB_IMPL_SERIALIZABLE_1_SINCE_v2_3(auth_semilattice_metadata_t, m_users);
+RDB_IMPL_SEMILATTICE_JOINABLE_1(auth_semilattice_metadata_t, m_users);
+RDB_IMPL_EQUALITY_COMPARABLE_1(auth_semilattice_metadata_t, m_users);
+
+RDB_IMPL_SERIALIZABLE_1_SINCE_v2_1(heartbeat_semilattice_metadata_t, heartbeat_timeout);
+RDB_IMPL_SEMILATTICE_JOINABLE_1(heartbeat_semilattice_metadata_t, heartbeat_timeout);
+RDB_IMPL_EQUALITY_COMPARABLE_1(heartbeat_semilattice_metadata_t, heartbeat_timeout);
 
 RDB_IMPL_SERIALIZABLE_9_FOR_CLUSTER(proc_directory_metadata_t,
     version,
@@ -47,7 +50,7 @@ bool search_db_metadata_by_name(
         const databases_semilattice_metadata_t &metadata,
         const name_string_t &name,
         database_id_t *id_out,
-        std::string *error_out) {
+        admin_err_t *error_out) {
     size_t found = 0;
     for (const auto &pair : metadata.databases) {
         if (!pair.second.is_deleted() && pair.second.get_ref().name.get_ref() == name) {
@@ -56,11 +59,15 @@ bool search_db_metadata_by_name(
         }
     }
     if (found == 0) {
-        *error_out = strprintf("Database `%s` does not exist.", name.c_str());
+        *error_out = admin_err_t{
+            strprintf("Database `%s` does not exist.", name.c_str()),
+            query_state_t::FAILED};
         return false;
     } else if (found >= 2) {
-        *error_out = strprintf("Database `%s` is ambiguous; there are multiple "
-            "databases with that name.", name.c_str());
+        *error_out = admin_err_t{
+            strprintf("Database `%s` is ambiguous; there are multiple "
+                      "databases with that name.", name.c_str()),
+            query_state_t::FAILED};
         return false;
     } else {
         return true;

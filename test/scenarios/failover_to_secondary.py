@@ -1,11 +1,11 @@
 #!/usr/bin/env python
-# Copyright 2010-2015 RethinkDB, all rights reserved.
+# Copyright 2010-2016 RethinkDB, all rights reserved.
 
 import os, sys, time
 from pprint import pformat
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, 'common')))
-import driver, workload_runner, rdb_unittest, scenario_common, utils, vcoptparse
+import workload_runner, rdb_unittest, scenario_common, utils, vcoptparse
 from utils import print_with_time
 
 op = vcoptparse.OptParser()
@@ -18,7 +18,6 @@ dbName, tableName = utils.get_test_db_table()
 
 numNodes = 3
 
-print_with_time("Starting cluster of %d servers" % numNodes)
 class FailoverToSecondary(rdb_unittest.RdbTestCase):
     
     shards = 1
@@ -46,7 +45,7 @@ class FailoverToSecondary(rdb_unittest.RdbTestCase):
             print_with_time("Starting workload before")
             workload.run_before()
             self.cluster.check()
-            issues = list(self.r.db('rethinkdb').table('current_issues').run(stableConn))
+            issues = list(self.r.db('rethinkdb').table('current_issues').filter(self.r.row["type"] != "memory_error").run(stableConn))
             self.assertEqual(issues, [], 'The server recorded the following issues after the run_before:\n%s' % pformat(issues))
             
             print_with_time("Shutting down the primary")
@@ -70,7 +69,7 @@ class FailoverToSecondary(rdb_unittest.RdbTestCase):
             timeout = 30
             try:
                 self.table.wait(wait_for='ready_for_writes', timeout=timeout).run(stableConn)
-            except self.r.RqlRuntimeError as e:
+            except self.r.ReqlRuntimeError as e:
                 raise AssertionError('Table did not become available after %d seconds.' % timeout)
             
             print_with_time("Running workload after")
@@ -78,8 +77,7 @@ class FailoverToSecondary(rdb_unittest.RdbTestCase):
             
         print_with_time("Cleaning up")
 
-# ==== main
+# ===== main
 
 if __name__ == '__main__':
-    import unittest
-    unittest.main(argv=[sys.argv[0]])
+    rdb_unittest.main()

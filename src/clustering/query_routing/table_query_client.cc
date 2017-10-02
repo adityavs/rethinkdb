@@ -4,24 +4,33 @@
 #include <functional>
 
 #include "clustering/query_routing/primary_query_client.hpp"
+#include "clustering/table_contract/cpu_sharding.hpp"
+#include "clustering/table_manager/multi_table_manager.hpp"
+#include "concurrency/cross_thread_signal.hpp"
 #include "concurrency/fifo_enforcer.hpp"
 #include "concurrency/watchable.hpp"
 #include "rdb_protocol/env.hpp"
 
 table_query_client_t::table_query_client_t(
+        const namespace_id_t &_table_id,
         mailbox_manager_t *mm,
         watchable_map_t<std::pair<peer_id_t, uuid_u>, table_query_bcard_t> *d,
-        rdb_context_t *_ctx)
-    : mailbox_manager(mm),
+        multi_table_manager_t *mtm,
+        rdb_context_t *_ctx,
+        table_meta_client_t *table_meta_client)
+    : table_id(_table_id),
+      mailbox_manager(mm),
       directory(d),
+      multi_table_manager(mtm),
       ctx(_ctx),
+      m_table_meta_client(table_meta_client),
       start_count(0),
       starting_up(true),
       subs(directory,
         std::bind(&table_query_client_t::update_registrant,
             this, ph::_1, ph::_2),
         initial_call_t::YES) {
-    rassert(ctx != NULL);
+    rassert(ctx != nullptr);
     starting_up = false;
     if (start_count == 0) {
         start_cond.pulse();
@@ -39,7 +48,12 @@ bool table_query_client_t::check_readiness(table_readiness_t readiness,
                 read_response_t res;
                 read_t r(dummy_read_t(), profile_bool_t::DONT_PROFILE,
                          read_mode_t::OUTDATED);
-                read(r, &res, order_token_t::ignore, interruptor);
+                read(
+                    auth::user_context_t(auth::permissions_t(tribool::True, tribool::False, tribool::False, tribool::False)),
+                    r,
+                    &res,
+                    order_token_t::ignore,
+                    interruptor);
             }
             break;
         case table_readiness_t::reads:
@@ -47,7 +61,12 @@ bool table_query_client_t::check_readiness(table_readiness_t readiness,
                 read_response_t res;
                 read_t r(dummy_read_t(), profile_bool_t::DONT_PROFILE,
                          read_mode_t::SINGLE);
-                read(r, &res, order_token_t::ignore, interruptor);
+                read(
+                    auth::user_context_t(auth::permissions_t(tribool::True, tribool::False, tribool::False, tribool::False)),
+                    r,
+                    &res,
+                    order_token_t::ignore,
+                    interruptor);
             }
             break;
         case table_readiness_t::finished: // Fallthrough in release mode, better than a crash
@@ -56,7 +75,12 @@ bool table_query_client_t::check_readiness(table_readiness_t readiness,
                 write_response_t res;
                 write_t w(dummy_write_t(), profile_bool_t::DONT_PROFILE,
                           ql::configured_limits_t::unlimited);
-                write(w, &res, order_token_t::ignore, interruptor);
+                write(
+                    auth::user_context_t(auth::permissions_t(tribool::True, tribool::True, tribool::False, tribool::False)),
+                    w,
+                    &res,
+                    order_token_t::ignore,
+                    interruptor);
             }
             break;
         case table_readiness_t::unavailable:
@@ -72,11 +96,23 @@ bool table_query_client_t::check_readiness(table_readiness_t readiness,
 }
 
 void table_query_client_t::read(
+        auth::user_context_t const &user_context,
         const read_t &r,
         read_response_t *response,
         order_token_t order_token,
         signal_t *interruptor)
-        THROWS_ONLY(interrupted_exc_t, cannot_perform_query_exc_t) {
+        THROWS_ONLY(
+            interrupted_exc_t, cannot_perform_query_exc_t, auth::permission_error_t) {
+    table_basic_config_t table_basic_config;
+    try {
+        m_table_meta_client->get_name(table_id, &table_basic_config);
+    } catch (no_such_table_exc_t const &) {
+        throw cannot_perform_query_exc_t(
+            "Failed to retrieve the table configuration", query_state_t::FAILED);
+    }
+
+    user_context.require_read_permission(ctx, table_basic_config.database, table_id);
+
     order_token.assert_read_mode();
     if (r.read_mode == read_mode_t::OUTDATED) {
         guarantee(!r.route_to_primary());
@@ -84,6 +120,9 @@ void table_query_client_t::read(
            `dispatch_outdated_read` needs to be able to see `outdated_read_info_t`,
            which is defined in the `private` section. */
         dispatch_outdated_read(r, response, interruptor);
+    } else if (r.read_mode == read_mode_t::DEBUG_DIRECT) {
+        guarantee(!r.route_to_primary());
+        dispatch_debug_direct_read(r, response, interruptor);
     } else {
         dispatch_immediate_op<read_t, fifo_enforcer_sink_t::exit_read_t, read_response_t>(
                 &primary_query_client_t::new_read_token,
@@ -93,11 +132,23 @@ void table_query_client_t::read(
 }
 
 void table_query_client_t::write(
+        auth::user_context_t const &user_context,
         const write_t &w,
         write_response_t *response,
         order_token_t order_token,
         signal_t *interruptor)
-        THROWS_ONLY(interrupted_exc_t, cannot_perform_query_exc_t) {
+        THROWS_ONLY(
+            interrupted_exc_t, cannot_perform_query_exc_t, auth::permission_error_t) {
+    table_basic_config_t table_basic_config;
+    try {
+        m_table_meta_client->get_name(table_id, &table_basic_config);
+    } catch (no_such_table_exc_t const &) {
+        throw cannot_perform_query_exc_t(
+            "Failed to retrieve the table configuration", query_state_t::FAILED);
+    }
+
+    user_context.require_write_permission(ctx, table_basic_config.database, table_id);
+
     order_token.assert_write_mode();
     dispatch_immediate_op<write_t, fifo_enforcer_sink_t::exit_write_t, write_response_t>(
         &primary_query_client_t::new_write_token,
@@ -119,7 +170,8 @@ std::set<region_t> table_query_client_t::get_sharding_scheme()
     if (res != REGION_JOIN_OK || whole != region_t::universe()) {
         throw cannot_perform_query_exc_t("cannot compute sharding scheme "
                                          "because primary replicas are "
-                                         "unavailable or duplicated");
+                                         "unavailable or duplicated",
+                                         query_state_t::FAILED);
     }
     return std::set<region_t>(
         std::make_move_iterator(s.begin()),
@@ -153,12 +205,18 @@ void table_query_client_t::dispatch_immediate_op(
     relationships.visit(region_t::universe(),
     [&](const region_t &reg, const std::set<relationship_t *> &rels) {
         if (op.shard(reg, &new_op_info->sharded_op)) {
-            relationship_t *chosen_relationship = NULL;
+            relationship_t *chosen_relationship = nullptr;
             for (auto jt = rels.begin(); jt != rels.end(); ++jt) {
-                if ((*jt)->primary_client) {
+                // If some shards are currently intersecting (this should only happen
+                // temporarily while resharding). `reg` might be a subset of the region
+                // of the relationships in `rels`.
+                // We need to test for that, so we don't send operations to a shard with
+                // the wrong boundaries.
+                if ((*jt)->primary_client && (*jt)->region == reg) {
                     if (chosen_relationship) {
                         throw cannot_perform_query_exc_t(
-                            "too many primary replicas available");
+                            "too many primary replicas available",
+                            query_state_t::FAILED);
                     }
                     chosen_relationship = *jt;
                 }
@@ -166,7 +224,8 @@ void table_query_client_t::dispatch_immediate_op(
             if (!chosen_relationship) {
                 throw cannot_perform_query_exc_t(
                     strprintf("primary replica for shard %s not available",
-                              key_range_to_string(reg.inner).c_str()));
+                              key_range_to_string(reg.inner).c_str()),
+                    query_state_t::FAILED);
             }
             new_op_info->primary_client = chosen_relationship->primary_client;
             (new_op_info->primary_client->*how_to_make_token)(
@@ -180,7 +239,8 @@ void table_query_client_t::dispatch_immediate_op(
     });
 
     std::vector<op_response_type> results(primaries_to_contact.size());
-    std::vector<std::string> failures(primaries_to_contact.size());
+    std::vector<optional<cannot_perform_query_exc_t> >
+        failures(primaries_to_contact.size());
     pmap(primaries_to_contact.size(), std::bind(
              &table_query_client_t::template perform_immediate_op<
                  op_type, fifo_enforcer_token_type, op_response_type>,
@@ -195,10 +255,30 @@ void table_query_client_t::dispatch_immediate_op(
 
     if (interruptor->is_pulsed()) throw interrupted_exc_t();
 
+    bool seen_non_failure = false;
+    optional<cannot_perform_query_exc_t> first_failure;
     for (size_t i = 0; i < primaries_to_contact.size(); ++i) {
-        if (!failures[i].empty()) {
-            throw cannot_perform_query_exc_t(failures[i]);
+        if (failures[i]) {
+            switch (failures[i]->get_query_state()) {
+            case query_state_t::FAILED:
+                if (!first_failure) first_failure = failures[i];
+                break;
+            case query_state_t::INDETERMINATE: throw *failures[i];
+            default: unreachable();
+            }
+        } else {
+            seen_non_failure = true;
         }
+        if (seen_non_failure && first_failure) {
+            // If we got different responses from the different shards, we
+            // default to the safest error type.
+            throw cannot_perform_query_exc_t(
+                first_failure->what(), query_state_t::INDETERMINATE);
+        }
+    }
+    if (first_failure) {
+        guarantee(!seen_non_failure);
+        throw *first_failure;
     }
 
     op.unshard(results.data(), results.size(), response, ctx, interruptor);
@@ -212,13 +292,14 @@ void table_query_client_t::perform_immediate_op(
         order_token_t,
         fifo_enforcer_token_type *,
         signal_t *)
-    /* THROWS_ONLY(interrupted_exc_t, resource_lost_exc_t, cannot_perform_query_exc_t) */,
+    /* THROWS_ONLY(interrupted_exc_t, resource_lost_exc_t,
+       cannot_perform_query_exc_t) */,
     std::vector<scoped_ptr_t<immediate_op_info_t<op_type, fifo_enforcer_token_type> > >
         *primaries_to_contact,
     std::vector<op_response_type> *results,
-    std::vector<std::string> *failures,
+    std::vector<optional<cannot_perform_query_exc_t> > *failures,
     order_token_t order_token,
-    int i,
+    size_t i,
     signal_t *interruptor)
     THROWS_NOTHING
 {
@@ -234,7 +315,7 @@ void table_query_client_t::perform_immediate_op(
             &primary_to_contact->enforcement_token,
             &waiter);
     } catch (const cannot_perform_query_exc_t& e) {
-        failures->at(i).assign("primary replica error: " + std::string(e.what()));
+        (*failures)[i].set(e);
     } catch (const interrupted_exc_t&) {
         if (interruptor->is_pulsed()) {
             /* Return immediately. `dispatch_immediate_op()` will notice that the
@@ -243,7 +324,9 @@ void table_query_client_t::perform_immediate_op(
         } else {
             /* `keepalive.get_drain_signal()` was pulsed because the other server
             disconnected or stopped being a primary */
-            failures->at(i).assign("lost contact with primary replica");
+            (*failures)[i].set(cannot_perform_query_exc_t(
+                "lost contact with primary replica",
+                query_state_t::INDETERMINATE));
         }
     }
 }
@@ -263,9 +346,11 @@ void table_query_client_t::dispatch_outdated_read(
     [&](const region_t &region, const std::set<relationship_t *> &rels) {
         if (op.shard(region, &new_op_info->sharded_op)) {
             std::vector<relationship_t *> potential_relationships;
-            relationship_t *chosen_relationship = NULL;
+            relationship_t *chosen_relationship = nullptr;
             for (auto jt = rels.begin(); jt != rels.end(); ++jt) {
-                if ((*jt)->direct_bcard != nullptr) {
+                // See the comment in `dispatch_immediate_op` about why we need to
+                // check that `region` and the relationship's region are the same.
+                if ((*jt)->direct_bcard != nullptr && (*jt)->region == region) {
                     if ((*jt)->is_local) {
                         chosen_relationship = *jt;
                         break;
@@ -276,13 +361,14 @@ void table_query_client_t::dispatch_outdated_read(
             }
             if (!chosen_relationship && !potential_relationships.empty()) {
                 chosen_relationship
-                    = potential_relationships[
-                        distributor_rng.randint(potential_relationships.size())];
+                    = potential_relationships[randint(potential_relationships.size())];
             }
             if (!chosen_relationship) {
                 /* Don't bother looking for masters; if there are no direct
                    readers, there won't be any masters either. */
-                throw cannot_perform_query_exc_t("no replica is available");
+                throw cannot_perform_query_exc_t(
+                    "no replica is available",
+                    query_state_t::FAILED);
             }
             new_op_info->direct_bcard = chosen_relationship->direct_bcard;
             new_op_info->keepalive = auto_drainer_t::lock_t(
@@ -302,7 +388,8 @@ void table_query_client_t::dispatch_outdated_read(
 
     for (size_t i = 0; i < replicas_to_contact.size(); ++i) {
         if (!failures[i].empty()) {
-            throw cannot_perform_query_exc_t(failures[i]);
+            // Reads are never indeterminate.
+            throw cannot_perform_query_exc_t(failures[i], query_state_t::FAILED);
         }
     }
 
@@ -313,13 +400,13 @@ void table_query_client_t::perform_outdated_read(
         std::vector<scoped_ptr_t<outdated_read_info_t> > *replicas_to_contact,
         std::vector<read_response_t> *results,
         std::vector<std::string> *failures,
-        int i,
+        size_t i,
         signal_t *interruptor) THROWS_NOTHING {
     outdated_read_info_t *replica_to_contact = (*replicas_to_contact)[i].get();
 
     try {
         cond_t done;
-        mailbox_t<void(read_response_t)> cont(mailbox_manager,
+        mailbox_t<read_response_t> cont(mailbox_manager,
             [&](signal_t *, const read_response_t &res) {
                 results->at(i) = res;
                 done.pulse();
@@ -340,6 +427,60 @@ void table_query_client_t::perform_outdated_read(
         /* Return immediately. `dispatch_immediate_op()` will notice that the
         interruptor has been pulsed. */
     }
+}
+
+void table_query_client_t::dispatch_debug_direct_read(
+        const read_t &op,
+        read_response_t *response,
+        signal_t *interruptor_on_caller)
+        THROWS_ONLY(interrupted_exc_t, cannot_perform_query_exc_t) {
+    cross_thread_signal_t interruptor_on_mtm(
+        interruptor_on_caller, multi_table_manager->home_thread());
+    on_thread_t thread_switcher(multi_table_manager->home_thread());
+    multi_table_manager->visit_table(table_id, &interruptor_on_mtm, access_t::read,
+    [&](multistore_ptr_t *multistore, table_manager_t *) {
+        if (multistore == nullptr) {
+            throw cannot_perform_query_exc_t(
+                "This server does not have any data available for the given table.",
+                query_state_t::FAILED);
+        }
+        std::vector<read_response_t> responses;
+        pmap(CPU_SHARDING_FACTOR, [&](size_t shard_number) {
+            try {
+                region_t region = cpu_sharding_subspace(shard_number);
+                read_t subread;
+                if (!op.shard(region, &subread)) {
+                    return;
+                }
+                read_response_t subresponse;
+                {
+                    store_view_t *store =
+                        multistore->get_cpu_sharded_store(shard_number);
+                    cross_thread_signal_t interruptor_on_store(
+                        &interruptor_on_mtm, store->home_thread());
+                    on_thread_t thread_switcher_2(store->home_thread());
+#ifndef NDEBUG
+                    metainfo_checker_t checker(
+                        region, [](const region_t &, const binary_blob_t &) {});
+#endif /* NDEBUG */
+                    read_token_t token;
+                    store->new_read_token(&token);
+                    store->read(
+                        DEBUG_ONLY(checker, )
+                        subread, &subresponse, &token,
+                        &interruptor_on_store);
+                }
+                responses.push_back(subresponse);
+            } catch (const interrupted_exc_t &) {
+                /* ignore; we'll catch it outside the pmap */
+            }
+        });
+        if (interruptor_on_mtm.is_pulsed()) {
+            throw interrupted_exc_t();
+        }
+        op.unshard(responses.data(), responses.size(), response, ctx,
+            &interruptor_on_mtm);
+    });
 }
 
 void table_query_client_t::update_registrant(
@@ -364,6 +505,10 @@ class region_map_set_membership_t {
 public:
     region_map_set_membership_t(region_map_t<std::set<value_t> > *m, const region_t &r, const value_t &v) :
         map(m), region(r), value(v) {
+        // Note that `visit_mutable` might split the region up if there are existing
+        // partially overlapping entries (e.g. during a rebalance).
+        // Once those entries go away, `region_map_t` should automatically merge the
+        // regions again.
         map->visit_mutable(region, [&](const region_t &, std::set<value_t> *set) {
             rassert(set->count(value) == 0);
             set->insert(value);

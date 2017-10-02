@@ -1,6 +1,8 @@
 #!/usr/bin/env python
-# Copyright 2010-2014 RethinkDB, all rights reserved.
-import sys, socket, random, time, os
+# Copyright 2010-2015 RethinkDB, all rights reserved.
+
+import os, sys
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, 'common')))
 import rdb_workload_common
 from vcoptparse import *

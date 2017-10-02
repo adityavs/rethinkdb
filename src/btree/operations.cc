@@ -382,7 +382,8 @@ void find_keyvalue_location_for_write(
         // KSI: We can't acquire the block for write here -- we could, but it would
         // worsen the performance of the program -- sometimes we only end up using
         // this block for read.  So the profiling information is not very good.
-        profile::starter_t starter("Acquiring block for write.\n", trace);
+        PROFILE_STARTER_IF_ENABLED(
+            trace != nullptr, "Acquiring block for write.", trace);
         buf = get_root(sizer, superblock);
     }
 
@@ -394,18 +395,21 @@ void find_keyvalue_location_for_write(
                 break;
             }
         }
-        // Check if the node is overfull and proactively split it if it is (since this is an internal node).
+        // Check if the node is overfull and proactively split it if it is (since this is
+        // an internal node).
         {
-            profile::starter_t starter("Perhaps split node.", trace);
-            check_and_handle_split(sizer, &buf, &last_buf, superblock, key,
-                                   NULL, balancing_detacher);
+            PROFILE_STARTER_IF_ENABLED(
+                trace != nullptr, "Perhaps split node.", trace);
+            check_and_handle_split(
+                sizer, &buf, &last_buf, superblock, key, nullptr, balancing_detacher);
         }
 
         // Check if the node is underfull, and merge/level if it is.
         {
-            profile::starter_t starter("Perhaps merge nodes.", trace);
-            check_and_handle_underfull(sizer, &buf, &last_buf, superblock, key,
-                                       balancing_detacher);
+            PROFILE_STARTER_IF_ENABLED(
+                trace != nullptr, "Perhaps merge nodes.", trace);
+            check_and_handle_underfull(
+                sizer, &buf, &last_buf, superblock, key, balancing_detacher);
         }
 
         // Release the superblock, if we've gone past the root (and haven't
@@ -413,12 +417,12 @@ void find_keyvalue_location_for_write(
         // its direct children, we might still want to replace the root, so
         // we can't release the superblock yet.
         if (!last_buf.empty() && keyvalue_location_out->superblock) {
-            if (pass_back_superblock != NULL) {
+            if (pass_back_superblock != nullptr) {
                 pass_back_superblock->pulse(superblock);
-                keyvalue_location_out->superblock = NULL;
+                keyvalue_location_out->superblock = nullptr;
             } else {
                 keyvalue_location_out->superblock->release();
-                keyvalue_location_out->superblock = NULL;
+                keyvalue_location_out->superblock = nullptr;
             }
         }
 
@@ -443,7 +447,8 @@ void find_keyvalue_location_for_write(
         rassert(node_id != NULL_BLOCK_ID && node_id != SUPERBLOCK_ID);
 
         {
-            profile::starter_t starter("Acquiring block for write.\n", trace);
+            PROFILE_STARTER_IF_ENABLED(
+                trace != nullptr, "Acquire a block for write.", trace);
             buf_lock_t tmp(&buf, node_id, access_t::write);
             last_buf = std::move(buf);
             buf = std::move(tmp);
@@ -487,7 +492,8 @@ void find_keyvalue_location_for_read(
 
     buf_lock_t buf;
     {
-        profile::starter_t starter("Acquire a block for read.", trace);
+        PROFILE_STARTER_IF_ENABLED(
+                trace != nullptr, "Acquire a block for read.", trace);;
         buf_lock_t tmp(superblock->expose_buf(), root_id, access_t::read);
         superblock->release();
         buf = std::move(tmp);
@@ -515,7 +521,8 @@ void find_keyvalue_location_for_read(
         rassert(node_id != NULL_BLOCK_ID && node_id != SUPERBLOCK_ID);
 
         {
-            profile::starter_t starter("Acquire a block for read.", trace);
+            PROFILE_STARTER_IF_ENABLED(
+                trace != nullptr, "Acquire a block for read.", trace);
             buf_lock_t tmp(&buf, node_id, access_t::read);
             buf.reset_buf_lock();
             buf = std::move(tmp);
@@ -551,7 +558,7 @@ void apply_keyvalue_change(
         const btree_key_t *key, repli_timestamp_t tstamp,
         const value_deleter_t *balancing_detacher,
         key_modification_callback_t *km_callback,
-        delete_or_erase_t delete_or_erase) {
+        delete_mode_t delete_mode) {
     key_modification_proof_t km_proof
         = km_callback->value_modification(kv_loc, key);
 
@@ -603,9 +610,10 @@ void apply_keyvalue_change(
         }
     } else {
         // Delete the value if it's there.
-        if (kv_loc->there_originally_was_value) {
+        if (kv_loc->there_originally_was_value ||
+                delete_mode != delete_mode_t::REGULAR_QUERY) {
             const repli_timestamp_t previous_leaf_recency = kv_loc->buf.get_recency();
-            if (delete_or_erase == delete_or_erase_t::DELETE) {
+            if (delete_mode != delete_mode_t::ERASE) {
                 /* Update the leaf node's recency to the greater of its previous recency
                 and the deletion's recency, to maintain the invariant that its recency is
                 greater than or equal to that of any entry pair in it. */
@@ -616,8 +624,9 @@ void apply_keyvalue_change(
             {
                 buf_write_t write(&kv_loc->buf);
                 auto leaf_node = static_cast<leaf_node_t *>(write.get_data_write());
-                switch (delete_or_erase) {
-                    case delete_or_erase_t::DELETE: {
+                switch (delete_mode) {
+                    case delete_mode_t::REGULAR_QUERY:   /* fall through */
+                    case delete_mode_t::MAKE_TOMBSTONE: {
                         leaf::remove(sizer,
                              leaf_node,
                              key,
@@ -625,7 +634,7 @@ void apply_keyvalue_change(
                              previous_leaf_recency,
                              km_proof);
                     } break;
-                    case delete_or_erase_t::ERASE: {
+                    case delete_mode_t::ERASE: {
                         leaf::erase_presence(sizer,
                             leaf_node,
                             key,
@@ -635,6 +644,8 @@ void apply_keyvalue_change(
                 }
 
             }
+        }
+        if (kv_loc->there_originally_was_value) {
             population_change = -1;
         } else {
             population_change = 0;

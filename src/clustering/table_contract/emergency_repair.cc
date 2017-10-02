@@ -24,26 +24,43 @@ bool quorum_dead(
     return alive * 2 <= servers.size();
 }
 
+/* Returns `true` if any of the servers in `servers` is also in `dead`. */
+bool any_dead(
+        const std::set<server_id_t> &servers, const std::set<server_id_t> &dead) {
+    for (const server_id_t &server : servers) {
+        if (dead.count(server) == 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void calculate_emergency_repair(
         const table_raft_state_t &old_state,
         const std::set<server_id_t> &dead_servers,
-        bool allow_erase,
+        emergency_repair_mode_t mode,
         table_raft_state_t *new_state_out,
         bool *rollback_found_out,
         bool *erase_found_out) {
     *rollback_found_out = false;
     *erase_found_out = false;
 
+    /* If we're in `"_debug_recommit"` mode we simply copy the old state and are done */
+    if (mode == emergency_repair_mode_t::DEBUG_RECOMMIT) {
+        *new_state_out = old_state;
+        return;
+    }
+
     /* Pick the server we'll use as a replacement for shards that we end up erasing */
-    server_id_t erase_replacement = nil_uuid();
+    server_id_t erase_replacement = server_id_t::from_server_uuid(nil_uuid());
     for (const auto &pair : old_state.member_ids) {
         if (dead_servers.count(pair.first) == 0) {
             erase_replacement = pair.first;
             break;
         }
     }
-    guarantee(!erase_replacement.is_nil(), "calculate_emergency_repair() should not be "
-        "called if all servers are dead");
+    guarantee(!erase_replacement.get_uuid().is_nil(),
+        "calculate_emergency_repair() should not be called if all servers are dead");
 
     /* Calculate the new contracts. This is the guts of the repair operation. */
     new_state_out->contracts.clear();
@@ -51,24 +68,27 @@ void calculate_emergency_repair(
         contract_t contract = pair.second.second;
         if (all_dead(contract.replicas, dead_servers)) {
             *erase_found_out = true;
-            if (allow_erase) {
+            if (mode == emergency_repair_mode_t::UNSAFE_ROLLBACK_OR_ERASE) {
                 /* Discard all previous replicas, and set up a new empty replica on
                 `erase_replacement`. */
                 contract = contract_t();
                 contract.replicas.insert(erase_replacement);
                 contract.voters.insert(erase_replacement);
+                contract.after_emergency_repair = true;
             }
         } else if (quorum_dead(contract.voters, dead_servers) ||
                 (static_cast<bool>(contract.temp_voters) &&
-                    quorum_dead(*contract.temp_voters, dead_servers))) {
+                    quorum_dead(*contract.temp_voters, dead_servers)) ||
+                (contract.after_emergency_repair &&
+                    any_dead(contract.voters, dead_servers))) {
             *rollback_found_out = true;
             /* Remove the primary (a new one will be elected) */
-            contract.primary = boost::none;
+            contract.primary.reset();
             /* Convert temp voters into voters */
             if (static_cast<bool>(contract.temp_voters)) {
                 contract.voters.insert(
                     contract.temp_voters->begin(), contract.temp_voters->end());
-                contract.temp_voters = boost::none;
+                contract.temp_voters.reset();
             }
             /* Forcibly demote all dead voters */
             for (const server_id_t &server : dead_servers) {
@@ -83,6 +103,8 @@ void calculate_emergency_repair(
                     }
                 }
             }
+            /* Record that we just did an emergency repair */
+            contract.after_emergency_repair = true;
         }
         /* We generate a new contract ID for the new contract, whether or not it's
         identical to the old contract. In practice this doesn't matter since contract IDs
@@ -101,6 +123,7 @@ void calculate_emergency_repair(
         new_state_out->config.config.write_ack_config =
             old_state.config.config.write_ack_config;
         new_state_out->config.config.durability = old_state.config.config.durability;
+        new_state_out->config.config.user_data = old_state.config.config.user_data;
 
         /* We first calculate all the voting and nonvoting replicas for each range in a
         `range_map_t`. */

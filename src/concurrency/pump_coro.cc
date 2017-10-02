@@ -1,9 +1,11 @@
 // Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "concurrency/pump_coro.hpp"
 
+#include "assignment_sentry.hpp"
 #include "arch/runtime/coroutines.hpp"
 #include "concurrency/interruptor.hpp"
 #include "containers/map_sentries.hpp"
+#include "utils.hpp"
 
 pump_coro_t::pump_coro_t(
         const std::function<void(signal_t *)> &_callback,
@@ -91,10 +93,11 @@ void pump_coro_t::run(auto_drainer_t::lock_t keepalive) {
         } catch (const interrupted_exc_t &) {
             return;
         }
+        coro_t::yield();
 
         acq.reset(&mutex);
         for (auto it = flush_waiters.begin();
-                it != flush_waiters.upper_bound(timestamp);
+                it != flush_waiters.upper_bound(local_timestamp);
                 ++it) {
             it->second->pulse_if_not_already_pulsed();
         }
@@ -104,7 +107,7 @@ void pump_coro_t::run(auto_drainer_t::lock_t keepalive) {
             break;
         }
     }
-    
+
     --running;
 }
 

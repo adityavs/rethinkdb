@@ -17,15 +17,45 @@ server_config_client_t::server_config_client_t(
         peer_connections_map,
         std::bind(&server_config_client_t::on_peer_connections_map_change,
             this, ph::_1, ph::_2),
+        initial_call_t::YES),
+    server_connectivity_subscription(
+        &connections_map,
+        std::bind(&server_config_client_t::update_server_connectivity,
+                  this,
+                  ph::_1,
+                  ph::_2),
         initial_call_t::YES)
     { }
+
+void server_config_client_t::update_server_connectivity(
+    const std::pair<server_id_t, server_id_t> &key,
+    const empty_value_t *val) {
+    if (val == nullptr) {
+        // Entry removed
+        if (--server_connectivity.all_servers[key.first] == 0) {
+            server_connectivity.all_servers.erase(key.first);
+        }
+        if (--server_connectivity.all_servers[key.second] == 0) {
+            server_connectivity.all_servers.erase(key.second);
+        }
+        server_connectivity.connected_to[key.first].erase(key.second);
+        if (server_connectivity.connected_to[key.first].empty()) {
+            server_connectivity.connected_to.erase(key.first);
+        }
+    } else {
+        // Entry added
+        ++server_connectivity.all_servers[key.first];
+        ++server_connectivity.all_servers[key.second];
+        server_connectivity.connected_to[key.first].insert(key.second);
+    }
+}
 
 bool server_config_client_t::set_config(
         const server_id_t &server_id,
         const name_string_t &old_server_name,
         const server_config_t &new_config,
         signal_t *interruptor,
-        std::string *error_out) {
+        admin_err_t *error_out) {
     bool name_collision = false, is_noop = false;
     server_config_map.read_all(
     [&](const server_id_t &sid, const server_config_versioned_t *conf) {
@@ -36,22 +66,25 @@ bool server_config_client_t::set_config(
         }
     });
     if (name_collision) {
-        *error_out = strprintf("Cannot rename server `%s` to `%s` because server `%s` "
-            "already exists.", old_server_name.c_str(), new_config.name.c_str(),
-            new_config.name.c_str());
+        *error_out = admin_err_t{
+            strprintf("Cannot rename server `%s` to `%s` because server `%s` "
+                      "already exists.",
+                      old_server_name.c_str(), new_config.name.c_str(),
+                      new_config.name.c_str()),
+            query_state_t::FAILED};
         return false;
     }
     if (is_noop) {
         return true;
     }
 
-    std::string disconnect_msg = strprintf("Lost contact with server `%s` while trying "
-        "to change the server configuration. The configuration may or may not have been "
-        "changed.", old_server_name.c_str());
-
-    boost::optional<peer_id_t> peer = server_to_peer_map.get_key(server_id);
-    if (!static_cast<bool>(peer)) {
-        *error_out = disconnect_msg;
+    optional<peer_id_t> peer = server_to_peer_map.get_key(server_id);
+    if (!peer.has_value()) {
+        std::string s = strprintf(
+            "Could not contact server `%s` while trying to change the server "
+            "configuration.  The configuration was not changed.",
+            old_server_name.c_str());
+        *error_out = admin_err_t{s, query_state_t::FAILED};
         return false;
     }
     server_config_business_card_t bcard;
@@ -63,7 +96,7 @@ bool server_config_client_t::set_config(
     server_config_version_t version;
     {
         promise_t<std::pair<server_config_version_t, std::string> > reply;
-        mailbox_t<void(server_config_version_t, std::string)> ack_mailbox(
+        mailbox_t<server_config_version_t, std::string> ack_mailbox(
             mailbox_manager,
             [&](signal_t *, server_config_version_t v, const std::string &m) {
                 reply.pulse(std::make_pair(v, m));
@@ -74,14 +107,22 @@ bool server_config_client_t::set_config(
         wait_any_t waiter(reply.get_ready_signal(), &disconnect_watcher);
         wait_interruptible(&waiter, interruptor);
         if (!reply.is_pulsed()) {
-            *error_out = disconnect_msg;
+
+            std::string disconnect_msg = strprintf(
+                "Lost contact with server `%s` while trying "
+                "to change the server configuration. The configuration may or may not "
+                "have been changed.", old_server_name.c_str());
+            *error_out = admin_err_t{disconnect_msg, query_state_t::INDETERMINATE};
             return false;
         }
         if (!reply.assert_get_value().second.empty()) {
             guarantee(reply.assert_get_value().first == 0);
-            *error_out = strprintf("Error when trying to change the configuration of "
-                "server `%s`: %s The configuration was not changed.",
-                old_server_name.c_str(), reply.assert_get_value().second.c_str());
+            *error_out = admin_err_t{
+                strprintf("Error when trying to change the configuration of "
+                          "server `%s`: %s The configuration was not changed.",
+                          old_server_name.c_str(),
+                          reply.assert_get_value().second.c_str()),
+                query_state_t::FAILED};
             return false;
         }
         version = reply.assert_get_value().first;
@@ -126,11 +167,29 @@ void server_config_client_t::on_directory_change(
         const peer_id_t &peer_id,
         const cluster_directory_metadata_t *metadata) {
     if (metadata != nullptr) {
+        // This is so we don't track servers inaccurately
+        // if metadata updates after connections.
+        peer_connections_map->read_all(
+            [&] (const std::pair<peer_id_t, server_id_t> &connection,
+                 const empty_value_t *value) {
+                if (connection.first == peer_id) {
+                    // This connection matches the directory view change
+                    if (value != nullptr) {
+                    connections_map.set_key(
+                        std::make_pair(metadata->server_id, connection.second),
+                        empty_value_t());
+                    } else {
+                        connections_map.delete_key(
+                            std::make_pair(metadata->server_id, connection.second));
+                    }
+                }
+            });
+
         if (metadata->peer_type != SERVER_PEER) {
             return;
         }
         const server_id_t &server_id = metadata->server_id;
-        if (!static_cast<bool>(peer_to_server_map.get_key(peer_id))) {
+        if (!peer_to_server_map.get_key(peer_id).has_value()) {
             all_server_to_peer_map.insert(std::make_pair(server_id, peer_id));
             peer_to_server_map.set_key(peer_id, server_id);
             install_server_metadata(peer_id, *metadata);
@@ -139,8 +198,8 @@ void server_config_client_t::on_directory_change(
         }
 
     } else {
-        boost::optional<server_id_t> server_id = peer_to_server_map.get_key(peer_id);
-        if (!static_cast<bool>(server_id)) {
+        optional<server_id_t> server_id = peer_to_server_map.get_key(peer_id);
+        if (!server_id.has_value()) {
             return;
         }
         for (auto it = all_server_to_peer_map.lower_bound(*server_id); ; ++it) {
@@ -152,12 +211,16 @@ void server_config_client_t::on_directory_change(
         }
         peer_to_server_map.delete_key(peer_id);
         server_to_peer_map.delete_key(*server_id);
-        peer_connections_map->read_all(
-            [&](const std::pair<peer_id_t, server_id_t> &pair, const empty_value_t *) {
-                if (pair.first == peer_id) {
-                    connections_map.delete_key(std::make_pair(*server_id, pair.second));
-                }
-            });
+        std::vector<std::pair<server_id_t, server_id_t> > connection_pairs_to_delete;
+        connections_map.read_all(
+        [&](const std::pair<server_id_t, server_id_t> &pair, const empty_value_t *) {
+            if (pair.first == *server_id) {
+                connection_pairs_to_delete.push_back(pair);
+            }
+        });
+        for (const auto &pair : connection_pairs_to_delete) {
+            connections_map.delete_key(pair);
+        }
         server_config_map.delete_key(*server_id);
 
         /* If there is another connected peer with the same server ID, reinstall its

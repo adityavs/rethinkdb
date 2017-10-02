@@ -1,4 +1,4 @@
-// Copyright 2010-2013 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #ifndef RDB_PROTOCOL_OP_HPP_
 #define RDB_PROTOCOL_OP_HPP_
 
@@ -17,6 +17,50 @@
 namespace ql {
 
 class func_term_t;
+
+enum class single_server_t { no, yes };
+enum class constant_now_t { no, yes };
+
+
+class deterministic_t {
+public:
+    // Is non-deterministic.
+    static deterministic_t no() { return deterministic_t(1); }
+
+    // Is non-deterministic if run across the cluster (different cpus, compilers,
+    // libc's), but is deterministic on a single server.  Example: geo operations.
+    static deterministic_t single_server() { return deterministic_t(2); }
+
+    // Is non-deterministic if r.now is non-constant.
+    static deterministic_t constant_now() { return deterministic_t(4); }
+
+    // Is always deterministic.
+    static deterministic_t always() { return deterministic_t(0); }
+
+    // Computes the combined deterministic-ness of two expressions.
+    deterministic_t join(deterministic_t other) const {
+        return deterministic_t(bitset | other.bitset);
+    }
+
+    // Params tell the situation:
+    //  - ss: are we running the term on a single server?
+    //  - cn: is r.now() constant?
+    // Returns true if the expression is deterministic (under the given conditions).
+    // ("The expression" is whatever expression this deterministic_t value was
+    // computed from.)
+    bool test(single_server_t ss, constant_now_t cn) const {
+        // Turn off the bits that don't apply.
+        int mask = (ss == single_server_t::yes ? single_server().bitset : 0)
+            | (cn == constant_now_t::yes ? constant_now().bitset : 0);
+        int remaining_bits = bitset & ~mask;
+        return remaining_bits == 0;
+    }
+
+private:
+    explicit deterministic_t(int bits) : bitset(bits) { }
+
+    int bitset;
+};
 
 // Specifies the range of normal arguments a function can take (arguments
 // provided by `r.args` count toward the total).  You may also optionally
@@ -60,15 +104,12 @@ class op_term_t;
 class argvec_t {
 public:
     explicit argvec_t(std::vector<counted_t<const runtime_term_t> > &&v);
-
     // Retrieves the arg.  The arg is removed (leaving an empty pointer in its
     // slot), forcing you to call this function exactly once per argument.
     MUST_USE counted_t<const runtime_term_t> remove(size_t i);
-
+    deterministic_t is_deterministic(size_t i) const;
     size_t size() const { return vec.size(); }
-
     bool empty() const { return vec.empty(); }
-
 private:
     std::vector<counted_t<const runtime_term_t> > vec;
 };
@@ -78,8 +119,8 @@ public:
     // number of arguments
     size_t num_args() const;
     // Returns argument `i`.
-    scoped_ptr_t<val_t> arg(scope_env_t *env, size_t i,
-                            eval_flags_t flags = NO_FLAGS);
+    scoped_ptr_t<val_t> arg(scope_env_t *env, size_t i, eval_flags_t flags = NO_FLAGS);
+    deterministic_t arg_is_deterministic(size_t i) const;
     // Tries to get an optional argument, returns `scoped_ptr_t<val_t>()` if not found.
     scoped_ptr_t<val_t> optarg(scope_env_t *env, const std::string &key) const;
 
@@ -97,10 +138,6 @@ private:
     DISABLE_COPYING(args_t);
 };
 
-// Calls is_deterministic on the map entries.
-bool all_are_deterministic(
-        const std::map<std::string, counted_t<const term_t> > &optargs);
-
 // Calls accumulate_captures on the map entries.
 void accumulate_all_captures(
         const std::map<std::string, counted_t<const term_t> > &optargs,
@@ -110,7 +147,7 @@ void accumulate_all_captures(
 // access their arguments.
 class op_term_t : public term_t {
 protected:
-    op_term_t(compile_env_t *env, protob_t<const Term> term,
+    op_term_t(compile_env_t *env, const raw_term_t &term,
               argspec_t argspec, optargspec_t optargspec = optargspec_t({}));
     virtual ~op_term_t();
 
@@ -120,16 +157,36 @@ protected:
     // * literal -- it checks whether this operation has the literal key you
     //   provided and doesn't look anywhere else for optargs (in particular, it
     //   doesn't check global optargs).
-    counted_t<func_term_t> lazy_literal_optarg(
-        compile_env_t *env, const std::string &key) const;
+    counted_t<const func_term_t> lazy_literal_optarg(
+            compile_env_t *env, const std::string &key) const;
 
     // Provides a default implementation, passing off a call to arg terms and optarg
     // terms.  implicit_var_term_t overrides this.  (var_term_t does too, but it's not
     // a subclass).
     virtual void accumulate_captures(var_captures_t *captures) const;
 
+    const std::vector<counted_t<const term_t> > &get_original_args() const;
+
+    virtual deterministic_t is_deterministic() const;
+
+    bool recursive_is_simple_selector() const {
+        for (const auto &term : get_original_args()) {
+            if (!term->is_simple_selector()) {
+                return false;
+            }
+        }
+        for (const auto &optarg_pair : optargs) {
+            if (!optarg_pair.second->is_simple_selector()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
 private:
     friend class args_t;
+    // Union term is a friend so we can steal arguments from an array.
+    friend class union_term_t;
     // Tries to get an optional argument, returns `scoped_ptr_t<val_t>()` if not found.
     scoped_ptr_t<val_t> optarg(scope_env_t *env, const std::string &key) const;
 
@@ -150,8 +207,6 @@ private:
     virtual bool can_be_grouped() const;
     virtual bool is_grouped_seq_op() const;
 
-    virtual bool is_deterministic() const;
-
     scoped_ptr_t<const arg_terms_t> arg_terms;
 
     std::map<std::string, counted_t<const term_t> > optargs;
@@ -168,7 +223,7 @@ private:
 
 class bounded_op_term_t : public op_term_t {
 public:
-    bounded_op_term_t(compile_env_t *env, protob_t<const Term> term,
+    bounded_op_term_t(compile_env_t *env, const raw_term_t &term,
                       argspec_t argspec, optargspec_t optargspec = optargspec_t({}));
 
     virtual ~bounded_op_term_t() { }

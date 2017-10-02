@@ -1,11 +1,11 @@
 #!/usr/bin/env python
-# Copyright 2010-2015 RethinkDB, all rights reserved.
+# Copyright 2010-2016 RethinkDB, all rights reserved.
 
 import os, sys, time
 from pprint import pformat
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, 'common')))
-import driver, rdb_unittest, scenario_common, utils, vcoptparse, workload_runner
+import rdb_unittest, scenario_common, utils, vcoptparse, workload_runner
 from utils import print_with_time
 
 numNodes = 3
@@ -16,7 +16,6 @@ scenario_common.prepare_option_parser_mode_flags(op)
 opts = op.parse(sys.argv)
 _, command_prefix, server_options = scenario_common.parse_mode_flags(opts)
 
-print_with_time("Starting cluster of %d servers" % numNodes)
 class KillSecondary(rdb_unittest.RdbTestCase):
     
     shards = 1
@@ -32,8 +31,8 @@ class KillSecondary(rdb_unittest.RdbTestCase):
         
         conn = self.r.connect(host=primary.host, port=primary.driver_port)
         
-        issues = list(self.r.db('rethinkdb').table('current_issues').run(conn))
-        self.assertEqual(issues, [], 'The issues list was not empty: %r' % issues)
+        issues = list(self.r.db('rethinkdb').table('current_issues').filter(self.r.row["type"] != "memory_error").run(self.conn))
+        self.assertEqual(issues, [], 'The issues list was not empty:\n%r' % utils.RePrint.pformat(issues))
 
         workload_ports = workload_runner.RDBPorts(host=primary.host, http_port=primary.http_port, rdb_port=primary.driver_port, db_name=self.dbName, table_name=self.tableName)
         with workload_runner.SplitOrContinuousWorkload(opts, workload_ports) as workload:
@@ -42,8 +41,8 @@ class KillSecondary(rdb_unittest.RdbTestCase):
             workload.run_before()
             
             self.cluster.check()
-            issues = list(self.r.db('rethinkdb').table('current_issues').run(conn))
-            self.assertEqual(issues, [], 'The issues list was not empty: %r' % issues)
+            issues = list(self.r.db('rethinkdb').table('current_issues').filter(self.r.row["type"] != "memory_error").run(self.conn))
+            self.assertEqual(issues, [], 'The issues list was not empty:\n%r' % utils.RePrint.pformat(issues))
         
             print_with_time("Killing the secondary")
             secondary.kill()
@@ -72,8 +71,7 @@ class KillSecondary(rdb_unittest.RdbTestCase):
             workload.run_after()
         print_with_time("Done")
 
-# ==== main
+# ===== main
 
 if __name__ == '__main__':
-    import unittest
-    unittest.main(argv=[sys.argv[0]])
+    rdb_unittest.main()

@@ -18,7 +18,7 @@ primary_dispatcher_t::dispatchee_registration_t::dispatchee_registration_t(
     queue_count_membership(
         &parent->perfmon_collection,
         &queue_count,
-        uuid_to_str(server_id) + "_broadcast_queue_count"),
+        uuid_to_str(server_id.get_uuid()) + "_broadcast_queue_count"),
     background_write_queue(&queue_count),
     background_write_workers(
         DISPATCH_WRITES_CORO_POOL_SIZE,
@@ -81,14 +81,14 @@ primary_dispatcher_t::primary_dispatcher_t(
 }
 
 void primary_dispatcher_t::read(
-        const read_t &read,
+        const read_t &_read,
         fifo_enforcer_sink_t::exit_read_t *lock,
         order_token_t order_token,
         signal_t *interruptor,
         read_response_t *response_out)
         THROWS_ONLY(cannot_perform_query_exc_t, interrupted_exc_t) {
     assert_thread();
-    rassert(region_is_superset(branch_bc.get_region(), read.get_region()));
+    rassert(region_is_superset(branch_bc.get_region(), _read.get_region()));
     order_token.assert_read_mode();
 
     dispatchee_registration_t *dispatchee = nullptr;
@@ -109,7 +109,7 @@ void primary_dispatcher_t::read(
             if (!d->is_ready) {
                 continue;
             }
-            if (read.route_to_primary() && !d->dispatchee->is_primary()) {
+            if (_read.route_to_primary() && !d->dispatchee->is_primary()) {
                 continue;
             }
             if (dispatchee == nullptr ||
@@ -122,7 +122,9 @@ void primary_dispatcher_t::read(
 
         rassert(dispatchee != nullptr, "Primary replica should always be ready");
         if (dispatchee == nullptr) {
-            throw cannot_perform_query_exc_t("No replicas are ready for reading.");
+            throw cannot_perform_query_exc_t(
+                "No replicas are ready for reading.",
+                query_state_t::FAILED);
         }
 
         order_checkpoint.check_through(order_token);
@@ -131,12 +133,14 @@ void primary_dispatcher_t::read(
 
     try {
         wait_any_t interruptor2(dispatchee_lock.get_drain_signal(), interruptor);
-        dispatchee->dispatchee->do_read(read, min_timestamp, &interruptor2, response_out);
+        dispatchee->dispatchee->do_read(_read, min_timestamp, &interruptor2, response_out);
     } catch (const interrupted_exc_t &) {
         if (interruptor->is_pulsed()) {
             throw;
         } else {
-            throw cannot_perform_query_exc_t("lost contact with replica during read");
+            throw cannot_perform_query_exc_t(
+                "Lost contact with replica during read.",
+                query_state_t::INDETERMINATE);
         }
     }
 }
@@ -167,14 +171,17 @@ void primary_dispatcher_t::spawn_write(
             unreachable();
     }
 
+    /* Assign a new timestamp to the write, unless it's a dummy write. */
+    if (boost::get<dummy_write_t>(&write.write) == nullptr) {
+        current_timestamp = current_timestamp.next();
+    }
+
     counted_t<incomplete_write_t> incomplete_write = make_counted<incomplete_write_t>(
         write,
-        current_timestamp.next(),
+        current_timestamp,
         order_checkpoint.check_through(order_token),
         durability,
         cb);
-
-    current_timestamp = current_timestamp.next();
 
     // You can't reuse the same callback for two writes.
     guarantee(cb->write == nullptr);
@@ -206,6 +213,24 @@ void primary_dispatcher_t::background_write(
         auto_drainer_t::lock_t dispatchee_lock,
         counted_t<incomplete_write_t> write) THROWS_NOTHING {
     try {
+        /* Use a special path for dummy writes.
+        dummy writes are used to check the table status, so we don't want to generate
+        unnecessary disk writes or block on previous writes.
+        We also never send a dummy write to a non-ready dispatchee, since
+        there's no reason for queueing them up (they are no-ops anyway). */
+        if (boost::get<dummy_write_t>(&write->write.write) != nullptr) {
+            if (dispatchee->is_ready) {
+                write_response_t response;
+                dispatchee->dispatchee->do_dummy_write(
+                    dispatchee_lock.get_drain_signal(), &response);
+                if (write->callback != nullptr) {
+                    guarantee(write->callback->write == write.get());
+                    write->callback->on_ack(dispatchee->server_id, std::move(response));
+                }
+            }
+            return;
+        }
+
         if (dispatchee->is_ready) {
             write_response_t response;
             dispatchee->dispatchee->do_write_sync(

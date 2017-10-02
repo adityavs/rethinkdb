@@ -49,6 +49,8 @@ public:
     ~session_t() {
         guarantee(!done_cond.is_pulsed() || items_mem_size_unacked == 0,
             "we seem to have leaked some semaphore credits");
+
+        parent->progress_tracker->is_ready = true;
     }
 
     /* `backfillee_t()` calls these callbacks when it receives messages from the
@@ -98,18 +100,19 @@ private:
                     credits. */
                     send_ack_items();
 
+                    /* `send_ack_items()` could block, so we have to check again */
+                    if (!items.empty_domain()) {
+                        break;
+                    }
+
                     if (got_ack_end_session.is_pulsed()) {
                         /* The callback returned false, so we sent an end-session message
                         to the backfiller, and it replied; then we drained the `items`
                         queue. So this session is over. */
                         guarantee(callback_returned_false);
+                        parent->progress_tracker->is_ready = true;
                         done_cond.pulse();
                         return;
-                    }
-
-                    /* `send_ack_items()` could block, so we have to check again */
-                    if (!items.empty_domain()) {
-                        break;
                     }
 
                     /* Wait for more items to arrive */
@@ -183,6 +186,15 @@ private:
                                 parent->callback_returned_false = true;
                                 parent->send_end_session_message();
                             }
+
+                            if (!new_threshold.unbounded) {
+                                const distribution_progress_estimator_t &estimator =
+                                    parent->parent->intro.progress_estimator;
+                                parent->parent->progress_tracker->progress =
+                                    estimator.estimate_progress(new_threshold.key());
+                            } else {
+                                parent->parent->progress_tracker->progress = 1.0;
+                            }
                         }
                         parent->threshold = new_threshold;
                     }
@@ -229,10 +241,13 @@ private:
 
             wait_interruptible(&got_ack_end_session, keepalive.get_drain_signal());
             guarantee(items.empty_domain());
+            parent->progress_tracker->is_ready = true;
             done_cond.pulse();
 
         } catch (const interrupted_exc_t &) {
-            /* The backfillee was destroyed */
+            /* The backfillee was destroyed, if the session is restarted `is_ready` will
+            be set to false again. */
+            parent->progress_tracker->is_ready = true;
         }
     }
 
@@ -305,11 +320,13 @@ backfillee_t::backfillee_t(
         store_view_t *_store,
         const backfiller_bcard_t &backfiller,
         const backfill_config_t &_backfill_config,
+        backfill_progress_tracker_t::progress_tracker_t *_progress_tracker,
         signal_t *interruptor) :
     mailbox_manager(_mailbox_manager),
     branch_history_manager(_branch_history_manager),
     store(_store),
     backfill_config(_backfill_config),
+    progress_tracker(_progress_tracker),
     pre_item_throttler(backfill_config.pre_item_queue_mem_size),
     pre_item_throttler_acq(&pre_item_throttler, 0),
     current_session(nullptr),
@@ -349,7 +366,7 @@ backfillee_t::backfillee_t(
 
     /* Set up a mailbox to receive the `intro_2_t` from the backfiller */
     cond_t got_intro;
-    mailbox_t<void(backfiller_bcard_t::intro_2_t)> intro_mailbox(
+    mailbox_t<backfiller_bcard_t::intro_2_t> intro_mailbox(
         mailbox_manager,
         [&](signal_t *, const backfiller_bcard_t::intro_2_t &i) {
             intro = i;
@@ -365,11 +382,8 @@ backfillee_t::backfillee_t(
 
     /* Record the branch history we got from the backfiller */
     {
-        cross_thread_signal_t interruptor_on_bhm_thread(
-            interruptor, branch_history_manager->home_thread());
         on_thread_t thread_switcher(branch_history_manager->home_thread());
-        branch_history_manager->import_branch_history(
-            intro.final_version_history, &interruptor_on_bhm_thread);
+        branch_history_manager->import_branch_history(intro.final_version_history);
     }
 
     /* Spawn the coroutine that will stream pre-items to the backfiller. */
@@ -380,6 +394,10 @@ backfillee_t::backfillee_t(
 backfillee_t::~backfillee_t() {
     /* This destructor is declared in the `.cc` file because we need to have the full
     definition of `session_t` in scope for the `scoped_ptr_t<session_t>` to work. */
+}
+
+uint64_t backfillee_t::get_num_changes_estimate() {
+    return intro.num_changes_estimate;
 }
 
 void backfillee_t::go(
@@ -435,7 +453,7 @@ void backfillee_t::send_pre_items(auto_drainer_t::lock_t keepalive) {
         while (pre_item_sent_threshold != store->get_region().inner.right) {
             /* Wait until there's room in the semaphore for the chunk we're about to
             process */
-            new_semaphore_acq_t sem_acq(
+            new_semaphore_in_line_t sem_acq(
                 &pre_item_throttler, backfill_config.pre_item_chunk_mem_size);
             wait_interruptible(
                 sem_acq.acquisition_signal(), keepalive.get_drain_signal());
@@ -478,7 +496,7 @@ void backfillee_t::send_pre_items(auto_drainer_t::lock_t keepalive) {
                 keepalive.get_drain_signal());
 
             /* Adjust for the fact that `chunk.get_mem_size()` isn't precisely equal to
-            `PRE_ITEM_CHUNK_SIZE`, and then transfer the semaphore ownership. */
+            `pre_item_chunk_mem_size`, and then transfer the semaphore ownership. */
             sem_acq.change_count(chunk.get_mem_size());
             pre_item_throttler_acq.transfer_in(std::move(sem_acq));
 

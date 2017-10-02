@@ -31,21 +31,21 @@ void primary_query_client_t::new_read_token(fifo_enforcer_sink_t::exit_read_t *o
 }
 
 void primary_query_client_t::read(
-        const read_t &read,
+        const read_t &_read,
         read_response_t *response,
         order_token_t otok,
         fifo_enforcer_sink_t::exit_read_t *token,
         signal_t *interruptor)
         THROWS_ONLY(interrupted_exc_t, cannot_perform_query_exc_t) {
-    rassert(region_is_superset(region, read.get_region()));
+    rassert(region_is_superset(region, _read.get_region()));
     otok.assert_read_mode();
 
-    promise_t<boost::variant<read_response_t, std::string> >
+    promise_t<boost::variant<read_response_t, cannot_perform_query_exc_t> >
         result_or_failure;
-    mailbox_t<void(boost::variant<read_response_t, std::string>)>
+    mailbox_t<boost::variant<read_response_t, cannot_perform_query_exc_t>>
         result_or_failure_mailbox(
             mailbox_manager,
-            [&](signal_t *, const boost::variant<read_response_t, std::string> &res) {
+            [&](signal_t *, const boost::variant<read_response_t, cannot_perform_query_exc_t> &res) {
                 result_or_failure.pulse(res);
             });
 
@@ -54,7 +54,7 @@ void primary_query_client_t::read(
     token->end();
 
     primary_query_bcard_t::read_request_t read_request(
-        read,
+        _read,
         otok,
         token_for_master,
         result_or_failure_mailbox.get_address());
@@ -63,8 +63,9 @@ void primary_query_client_t::read(
 
     wait_interruptible(result_or_failure.get_ready_signal(), interruptor);
 
-    if (const std::string *error = boost::get<std::string>(&result_or_failure.wait())) {
-        throw cannot_perform_query_exc_t(*error);
+    if (const cannot_perform_query_exc_t *error
+        = boost::get<cannot_perform_query_exc_t>(&result_or_failure.wait())) {
+        throw *error;
     } else if (const read_response_t *result =
             boost::get<read_response_t>(
                 &result_or_failure.wait())) {
@@ -79,19 +80,19 @@ void primary_query_client_t::new_write_token(fifo_enforcer_sink_t::exit_write_t 
 }
 
 void primary_query_client_t::write(
-        const write_t &write,
+        const write_t &_write,
         write_response_t *response,
         order_token_t otok,
         fifo_enforcer_sink_t::exit_write_t *token,
         signal_t *interruptor)
         THROWS_ONLY(interrupted_exc_t, cannot_perform_query_exc_t) {
-    rassert(region_is_superset(region, write.get_region()));
+    rassert(region_is_superset(region, _write.get_region()));
     otok.assert_write_mode();
 
-    promise_t<boost::variant<write_response_t, std::string> > result_or_failure;
-    mailbox_t<void(boost::variant<write_response_t, std::string>)> result_or_failure_mailbox(
+    promise_t<boost::variant<write_response_t, cannot_perform_query_exc_t> > result_or_failure;
+    mailbox_t<boost::variant<write_response_t, cannot_perform_query_exc_t>> result_or_failure_mailbox(
         mailbox_manager,
-        [&](signal_t *, const boost::variant<write_response_t, std::string> &res) {
+        [&](signal_t *, const boost::variant<write_response_t, cannot_perform_query_exc_t> &res) {
             result_or_failure.pulse(res);
         });
 
@@ -100,7 +101,7 @@ void primary_query_client_t::write(
     token->end();
 
     primary_query_bcard_t::write_request_t write_request(
-        write,
+        _write,
         otok,
         token_for_master,
         result_or_failure_mailbox.get_address());
@@ -109,7 +110,9 @@ void primary_query_client_t::write(
 
     wait_interruptible(result_or_failure.get_ready_signal(), interruptor);
 
-    if (const std::string *error = boost::get<std::string>(&result_or_failure.wait())) {
+    if (const cannot_perform_query_exc_t *error
+        = boost::get<cannot_perform_query_exc_t>(&result_or_failure.wait())) {
+        throw *error;
         throw cannot_perform_query_exc_t(*error);
     } else if (const write_response_t *result =
             boost::get<write_response_t>(&result_or_failure.wait())) {

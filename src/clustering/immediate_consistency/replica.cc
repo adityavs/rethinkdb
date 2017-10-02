@@ -28,6 +28,14 @@ void replica_t::do_read(
     rassert(region_is_superset(store->get_region(), read.get_region()));
     rassert(!region_is_empty(read.get_region()));
 
+    if (boost::get<dummy_read_t>(&read.read) != nullptr) {
+        read_response_t response;
+        response.response = dummy_read_response_t();
+        response.n_shards = 1;
+        *response_out = std::move(response);
+        return;
+    }
+
     // Wait until all writes that the read needs to see have completed.
     end_enforcer.wait_all_before(min_timestamp, interruptor);
 
@@ -98,10 +106,17 @@ void replica_t::do_write(
     end_enforcer.complete(timestamp);
 }
 
+void replica_t::do_dummy_write(
+        UNUSED signal_t *interruptor,
+        write_response_t *response_out) {
+    assert_thread();
+    response_out->response = dummy_write_response_t();
+}
+
 void replica_t::on_synchronize(
         signal_t *interruptor,
         state_timestamp_t timestamp,
-        mailbox_t<void()>::address_t ack_addr) {
+        mailbox_t<>::address_t ack_addr) {
     end_enforcer.wait_all_before(timestamp, interruptor);
     send(mailbox_manager, ack_addr);
 }

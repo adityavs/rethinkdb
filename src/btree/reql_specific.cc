@@ -8,25 +8,38 @@
 /* This is the actual structure stored on disk for the superblock of a table's primary or
 sindex B-tree. Both of them use the exact same format, but the sindex B-trees don't make
 use of the `sindex_block` or `metainfo_blob` fields. */
-struct reql_btree_superblock_t {
+ATTR_PACKED(struct reql_btree_superblock_t {
     block_magic_t magic;
     block_id_t root_block;
     block_id_t stat_block;
     block_id_t sindex_block;
 
     static const int METAINFO_BLOB_MAXREFLEN
-        = from_ser_block_size_t<DEVICE_BLOCK_SIZE>::cache_size - sizeof(magic)
-                                                               - sizeof(root_block)
-                                                               - sizeof(stat_block)
-                                                               - sizeof(sindex_block);
+        = from_ser_block_size_t<DEVICE_BLOCK_SIZE>::cache_size - sizeof(block_magic_t)
+                                                               - 3 * sizeof(block_id_t);
 
     char metainfo_blob[METAINFO_BLOB_MAXREFLEN];
+});
 
-    static const block_magic_t expected_magic;
-} __attribute__((__packed__));
 static const uint32_t REQL_BTREE_SUPERBLOCK_SIZE = sizeof(reql_btree_superblock_t);
 
-const block_magic_t reql_btree_superblock_t::expected_magic = { { 's', 'u', 'p', 'e' } };
+template <cluster_version_t>
+struct reql_btree_version_magic_t {
+    static const block_magic_t value;
+};
+
+// All pre-2.1 values are the same, so we treat them all as v2.0.x
+// Versions pre-2.1 store version_range_ts in their metainfo
+template <>
+const block_magic_t
+    reql_btree_version_magic_t<cluster_version_t::v2_0>::value =
+        { { 's', 'u', 'p', 'e' } };
+
+// Versions post-2.1 store version_ts in their metainfo
+template <>
+const block_magic_t
+    reql_btree_version_magic_t<cluster_version_t::v2_1>::value =
+        { { 's', 'u', 'p', 'f' } };
 
 void btree_superblock_ct_asserts() {
     // Just some place to put the CT_ASSERTs
@@ -40,7 +53,7 @@ real_superblock_t::real_superblock_t(buf_lock_t &&sb_buf)
 
 real_superblock_t::real_superblock_t(
         buf_lock_t &&sb_buf,
-        new_semaphore_acq_t &&write_semaphore_acq)
+        new_semaphore_in_line_t &&write_semaphore_acq)
     : write_semaphore_acq_(std::move(write_semaphore_acq)),
       sb_buf_(std::move(sb_buf)) {}
 
@@ -48,12 +61,17 @@ void real_superblock_t::release() {
     sb_buf_.reset_buf_lock();
 }
 
+const reql_btree_superblock_t *get_reql_btree_superblock(buf_read_t *read) {
+    uint16_t sb_size;
+    const reql_btree_superblock_t *sb_data
+        = static_cast<const reql_btree_superblock_t *>(read->get_data_read(&sb_size));
+    guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+    return sb_data;
+}
+
 block_id_t real_superblock_t::get_root_block_id() {
     buf_read_t read(&sb_buf_);
-    uint32_t sb_size;
-    const reql_btree_superblock_t *sb_data
-        = static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
-    guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+    const reql_btree_superblock_t *sb_data = get_reql_btree_superblock(&read);
     return sb_data->root_block;
 }
 
@@ -66,19 +84,13 @@ void real_superblock_t::set_root_block_id(const block_id_t new_root_block) {
 
 block_id_t real_superblock_t::get_stat_block_id() {
     buf_read_t read(&sb_buf_);
-    uint32_t sb_size;
-    const reql_btree_superblock_t *sb_data =
-        static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
-    guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+    const reql_btree_superblock_t *sb_data = get_reql_btree_superblock(&read);
     return sb_data->stat_block;
 }
 
 block_id_t real_superblock_t::get_sindex_block_id() {
     buf_read_t read(&sb_buf_);
-    uint32_t sb_size;
-    const reql_btree_superblock_t *sb_data =
-        static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
-    guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+    const reql_btree_superblock_t *sb_data = get_reql_btree_superblock(&read);
     return sb_data->sindex_block;
 }
 
@@ -91,10 +103,7 @@ void sindex_superblock_t::release() {
 
 block_id_t sindex_superblock_t::get_root_block_id() {
     buf_read_t read(&sb_buf_);
-    uint32_t sb_size;
-    const reql_btree_superblock_t *sb_data
-        = static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
-    guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+    const reql_btree_superblock_t *sb_data = get_reql_btree_superblock(&read);
     return sb_data->root_block;
 }
 
@@ -107,19 +116,13 @@ void sindex_superblock_t::set_root_block_id(const block_id_t new_root_block) {
 
 block_id_t sindex_superblock_t::get_stat_block_id() {
     buf_read_t read(&sb_buf_);
-    uint32_t sb_size;
-    const reql_btree_superblock_t *sb_data =
-        static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
-    guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+    const reql_btree_superblock_t *sb_data = get_reql_btree_superblock(&read);
     return sb_data->stat_block;
 }
 
 block_id_t sindex_superblock_t::get_sindex_block_id() {
     buf_read_t read(&sb_buf_);
-    uint32_t sb_size;
-    const reql_btree_superblock_t *sb_data =
-        static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
-    guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+    const reql_btree_superblock_t *sb_data = get_reql_btree_superblock(&read);
     return sb_data->sindex_block;
 }
 
@@ -136,12 +139,13 @@ void btree_slice_t::init_real_superblock(real_superblock_t *superblock,
     // Properly zero the superblock, zeroing sb->metainfo_blob, in particular.
     memset(sb, 0, REQL_BTREE_SUPERBLOCK_SIZE);
 
-    sb->magic = reql_btree_superblock_t::expected_magic;
+    sb->magic = reql_btree_version_magic_t<cluster_version_t::v2_1>::value;
     sb->root_block = NULL_BLOCK_ID;
     sb->stat_block = create_stat_block(buf_parent_t(superblock->get()->txn()));
     sb->sindex_block = NULL_BLOCK_ID;
 
-    set_superblock_metainfo(superblock, metainfo_key, metainfo_value);
+    set_superblock_metainfo(superblock, metainfo_key, metainfo_value,
+                            cluster_version_t::v2_1);
 
     buf_lock_t sindex_block(superblock->get(), alt_create_t::create);
     initialize_secondary_indexes(&sindex_block);
@@ -156,7 +160,7 @@ void btree_slice_t::init_sindex_superblock(sindex_superblock_t *superblock) {
     // Properly zero the superblock, zeroing sb->metainfo_blob, in particular.
     memset(sb, 0, REQL_BTREE_SUPERBLOCK_SIZE);
 
-    sb->magic = reql_btree_superblock_t::expected_magic;
+    sb->magic = reql_btree_version_magic_t<cluster_version_t::v2_1>::value;
     sb->root_block = NULL_BLOCK_ID;
     sb->stat_block = NULL_BLOCK_ID;
     sb->sindex_block = NULL_BLOCK_ID;
@@ -213,7 +217,7 @@ void superblock_metainfo_iterator_t::advance(char * p) {
 check_failed:
     pos = next_pos = end;
     key_size = value_size = 0;
-    key_ptr = value_ptr = NULL;
+    key_ptr = value_ptr = nullptr;
 }
 
 void superblock_metainfo_iterator_t::operator++() {
@@ -224,14 +228,20 @@ void superblock_metainfo_iterator_t::operator++() {
 
 void get_superblock_metainfo(
         real_superblock_t *superblock,
-        std::vector<std::pair<std::vector<char>, std::vector<char> > > *kv_pairs_out) {
+        std::vector<std::pair<std::vector<char>, std::vector<char> > > *kv_pairs_out,
+        cluster_version_t *version_out) {
     std::vector<char> metainfo;
     {
         buf_read_t read(superblock->get());
-        uint32_t sb_size;
-        const reql_btree_superblock_t *data
-            = static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
-        guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+        const reql_btree_superblock_t *data = get_reql_btree_superblock(&read);
+
+        if (data->magic == reql_btree_version_magic_t<cluster_version_t::v2_1>::value) {
+            *version_out = cluster_version_t::v2_1;
+        } else if (data->magic == reql_btree_version_magic_t<cluster_version_t::v2_0>::value) {
+            *version_out = cluster_version_t::v2_0;
+        } else {
+            crash("Unrecognized reql_btree_superblock_t::magic found.");
+        }
 
         // The const cast is okay because we access the data with access_t::read
         // and don't write to the blob.
@@ -261,19 +271,29 @@ void get_superblock_metainfo(
 
 void set_superblock_metainfo(real_superblock_t *superblock,
                              const std::vector<char> &key,
-                             const binary_blob_t &value) {
+                             const binary_blob_t &value,
+                             cluster_version_t version) {
     std::vector<std::vector<char> > keys = {key};
     std::vector<binary_blob_t> values = {value};
-    set_superblock_metainfo(superblock, keys, values);
+    set_superblock_metainfo(superblock, keys, values, version);
 }
 
 void set_superblock_metainfo(real_superblock_t *superblock,
                              const std::vector<std::vector<char> > &keys,
-                             const std::vector<binary_blob_t> &values) {
+                             const std::vector<binary_blob_t> &values,
+                             cluster_version_t version) {
     buf_write_t write(superblock->get());
     reql_btree_superblock_t *data
         = static_cast<reql_btree_superblock_t *>(
             write.get_data_write(REQL_BTREE_SUPERBLOCK_SIZE));
+
+    if (version == cluster_version_t::v2_0) {
+        data->magic = reql_btree_version_magic_t<cluster_version_t::v2_0>::value;
+    } else if (version == cluster_version_t::v2_1) {
+        data->magic = reql_btree_version_magic_t<cluster_version_t::v2_1>::value;
+    } else {
+        crash("Unsupported version when writing metainfo.");
+    }
 
     blob_t blob(superblock->get()->cache()->max_block_size(),
                 data->metainfo_blob, reql_btree_superblock_t::METAINFO_BLOB_MAXREFLEN);
@@ -331,7 +351,7 @@ void get_btree_superblock(
 void get_btree_superblock(
         txn_t *txn,
         UNUSED write_access_t access,
-        new_semaphore_acq_t &&write_sem_acq,
+        new_semaphore_in_line_t &&write_sem_acq,
         scoped_ptr_t<real_superblock_t> *got_superblock_out) {
     buf_lock_t tmp_buf(buf_parent_t(txn), SUPERBLOCK_ID, access_t::write);
     scoped_ptr_t<real_superblock_t> tmp_sb(
@@ -352,7 +372,7 @@ void get_btree_superblock_and_txn_for_writing(
     txn_out->init(txn);
 
     /* Acquire a ticket from the superblock_write_semaphore */
-    new_semaphore_acq_t sem_acq;
+    new_semaphore_in_line_t sem_acq;
     if(superblock_write_semaphore != nullptr) {
         sem_acq.init(superblock_write_semaphore, 1);
         sem_acq.acquisition_signal()->wait();

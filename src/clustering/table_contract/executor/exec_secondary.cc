@@ -9,14 +9,11 @@
 
 secondary_execution_t::secondary_execution_t(
         const execution_t::context_t *_context,
-        store_view_t *_store,
-        perfmon_collection_t *_perfmon_collection,
-        const std::function<void(
-            const contract_id_t &, const contract_ack_t &)> &_ack_cb,
+        execution_t::params_t *_params,
         const contract_id_t &cid,
         const table_raft_state_t &raft_state,
         const branch_id_t &_branch) :
-    execution_t(_context, _store, _perfmon_collection, _ack_cb)
+    execution_t(_context, _params)
 {
     const contract_t &c = raft_state.contracts.at(cid).second;
     guarantee(c.replicas.count(context->server_id) == 1);
@@ -36,11 +33,14 @@ secondary_execution_t::secondary_execution_t(
         primary = c.primary->server;
     } else {
         connect_to_primary = false;
-        primary = nil_uuid();
+        primary = server_id_t::from_server_uuid(nil_uuid());
     }
 
     branch = _branch;
     contract_id = cid;
+    is_critical_priority = c.is_voter(context->server_id)
+        ? backfill_throttler_t::priority_t::critical_t::YES
+        : backfill_throttler_t::priority_t::critical_t::NO;
     coro_t::spawn_sometime(std::bind(&secondary_execution_t::run, this, drainer.lock()));
 }
 
@@ -51,16 +51,20 @@ void secondary_execution_t::update_contract_or_raft_state(
     const contract_t &c = raft_state.contracts.at(cid).second;
     guarantee(raft_state.contracts.at(cid).first == region);
     guarantee(c.replicas.count(context->server_id) == 1);
-    guarantee(primary.is_nil() || primary == c.primary->server);
-    contract_id = cid;
-    if (static_cast<bool>(last_ack)) {
-        ack_cb(contract_id, *last_ack);
+    guarantee(primary.get_uuid().is_nil() || primary == c.primary->server);
+    if (contract_id != cid && static_cast<bool>(last_ack)) {
+        params->send_ack(cid, *last_ack);
     }
+    contract_id = cid;
+    is_critical_priority = c.is_voter(context->server_id)
+        ? backfill_throttler_t::priority_t::critical_t::YES
+        : backfill_throttler_t::priority_t::critical_t::NO;
 }
 
 void secondary_execution_t::run(auto_drainer_t::lock_t keepalive) {
     assert_thread();
     order_source_t order_source(store->home_thread());
+    bool enabled_gc = false;
     while (!keepalive.get_drain_signal()->is_pulsed()) {
         try {
             /* Switch to the store thread so we can extract our metainfo and set up the
@@ -73,7 +77,7 @@ void secondary_execution_t::run(auto_drainer_t::lock_t keepalive) {
             contract_ack_t initial_ack(contract_ack_t::state_t::secondary_need_primary);
             read_token_t token;
             store->new_read_token(&token);
-            initial_ack.version = boost::make_optional(to_version_map(
+            initial_ack.version.set(to_version_map(
                 store->get_metainfo(
                     order_source.check_in("secondary_execution_t").with_read_mode(),
                     &token, region, &interruptor_on_store_thread)));
@@ -83,6 +87,9 @@ void secondary_execution_t::run(auto_drainer_t::lock_t keepalive) {
             /* Switch back to the home thread so we can send the initial ack */
             on_thread_t thread_switcher_2(home_thread());
 
+            context->branch_history_manager->export_branch_history(
+                *initial_ack.version, &initial_ack.branch_history);
+
             send_ack(initial_ack);
 
             /* Serve outdated reads while we wait for the primary */
@@ -91,7 +98,7 @@ void secondary_execution_t::run(auto_drainer_t::lock_t keepalive) {
             {
                 table_query_bcard_t tq_bcard;
                 tq_bcard.region = region;
-                tq_bcard.direct = boost::make_optional(direct_query_server.get_bcard());
+                tq_bcard.direct = make_optional(direct_query_server.get_bcard());
                 directory_entry.create(
                     context->local_table_query_bcards, generate_uuid(), tq_bcard);
             }
@@ -144,6 +151,11 @@ void secondary_execution_t::run(auto_drainer_t::lock_t keepalive) {
             /* Let the coordinator know we found the primary. */
             send_ack(contract_ack_t(contract_ack_t::state_t::secondary_backfilling));
 
+            /* While we're on the home thread, make a local copy of
+            `is_critical_priority` */
+            backfill_throttler_t::priority_t::critical_t local_is_critical_priority =
+                is_critical_priority;
+
             /* Set up a signal that will get pulsed if we lose contact with the primary
             or we get interrupted */
             wait_any_t stop_signal(
@@ -162,16 +174,25 @@ void secondary_execution_t::run(auto_drainer_t::lock_t keepalive) {
             remote_replicator_client_t remote_replicator_client(
                 context->backfill_throttler,
                 backfill_config_t(),
+                context->backfill_progress_tracker,
                 context->mailbox_manager,
                 context->server_id,
+                local_is_critical_priority,
                 branch,
                 primary_bcard.assert_get_value().remote_replicator_server,
                 primary_bcard.assert_get_value().replica,
+                primary,
                 store,
                 context->branch_history_manager,
                 &stop_signal_on_store_thread);
 
             on_thread_t thread_switcher_4(home_thread());
+
+            /* Now that we've backfilled, it's safe to call `enable_gc()`. */
+            if (!enabled_gc) {
+                enabled_gc = true;
+                params->enable_gc(branch);
+            }
 
             /* Let the coordinator know we finished backfilling */
             send_ack(contract_ack_t(contract_ack_t::state_t::secondary_streaming));
@@ -180,7 +201,7 @@ void secondary_execution_t::run(auto_drainer_t::lock_t keepalive) {
             {
                 table_query_bcard_t tq_bcard;
                 tq_bcard.region = region;
-                tq_bcard.direct = boost::make_optional(direct_query_server.get_bcard());
+                tq_bcard.direct = make_optional(direct_query_server.get_bcard());
                 directory_entry.create(
                     context->local_table_query_bcards, generate_uuid(), tq_bcard);
             }
@@ -196,7 +217,7 @@ void secondary_execution_t::run(auto_drainer_t::lock_t keepalive) {
 
 void secondary_execution_t::send_ack(const contract_ack_t &ca) {
     assert_thread();
-    ack_cb(contract_id, ca);
-    last_ack = boost::make_optional(ca);
+    params->send_ack(contract_id, ca);
+    last_ack = make_optional(ca);
 }
 

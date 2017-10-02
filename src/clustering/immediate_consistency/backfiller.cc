@@ -2,6 +2,7 @@
 #include "clustering/immediate_consistency/backfiller.hpp"
 
 #include "clustering/immediate_consistency/history.hpp"
+#include "rdb_protocol/distribution_progress.hpp"
 #include "rdb_protocol/protocol.hpp"
 #include "store_view.hpp"
 
@@ -61,10 +62,19 @@ backfiller_t::client_t::client_t(
             [&](const region_t &region1, const version_t &version1) {
                 return our_version.map_multi(region1,
                     [&](const region_t &region2, const version_t &version2) {
-                        return version_find_common(
-                                &combined_history, version1, version2, region2)
-                            .map(region2,
-                                [](const version_t &v) { return v.timestamp; });
+                        try {
+                            return version_find_common(
+                                    &combined_history, version1, version2, region2)
+                                .map(region2,
+                                    [](const version_t &v) { return v.timestamp; });
+                        } catch (const missing_branch_exc_t &) {
+                            /* If we don't have enough information to determine the
+                            common ancestor of the two versions, act as if it's zero.
+                            This will always produce correct results but it might make us
+                            do more backfilling than necessary. */
+                            return region_map_t<state_timestamp_t>(
+                                region2, state_timestamp_t::zero());
+                        }
                     });
             });
 
@@ -76,6 +86,29 @@ backfiller_t::client_t::client_t(
             our_version, &our_version_history);
     }
 
+    /* Fetch the key distribution from the store, this is used by the backfillee to
+    calculate the progress of backfill jobs. */
+    distribution_progress_estimator_t progress_estimator(parent->store, interruptor);
+
+    /* Estimate the total number of changes that will need to be backfilled, by comparing
+    `our_version`, `intro.initial_version`, and `common_version`. We estimate the number
+    of changes as the largest version difference. In theory we could be smarter by
+    cross-referencing with `distribution_counts`, but it's not worth the trouble for now.
+    */
+    uint64_t num_changes_estimate = 0;
+    our_version.visit(full_region, [&](const region_t &r1, const version_t &v1) {
+        intro.initial_version.visit(r1, [&](const region_t &r2, const version_t &v2) {
+            common_version.visit(r2, [&](const region_t &, const state_timestamp_t &b) {
+                guarantee(v1.timestamp >= b);
+                guarantee(v2.timestamp >= b);
+                uint64_t backfiller_changes = v1.timestamp.count_changes(b);
+                uint64_t backfillee_changes = v2.timestamp.count_changes(b);
+                uint64_t total_changes = backfiller_changes + backfillee_changes;
+                num_changes_estimate = std::max(num_changes_estimate, total_changes);
+            });
+        });
+    });
+
     /* Send the computed common ancestor to the backfillee, along with the mailboxes it
     can use to contact us. */
     backfiller_bcard_t::intro_2_t our_intro;
@@ -85,6 +118,8 @@ backfiller_t::client_t::client_t(
     our_intro.begin_session_mailbox = begin_session_mailbox.get_address();
     our_intro.end_session_mailbox = end_session_mailbox.get_address();
     our_intro.ack_items_mailbox = ack_items_mailbox.get_address();
+    our_intro.num_changes_estimate = num_changes_estimate;
+    our_intro.progress_estimator = std::move(progress_estimator);
     send(parent->mailbox_manager, intro.intro_mailbox, our_intro);
 }
 
@@ -208,8 +243,11 @@ private:
         try {
             while (threshold != parent->full_region.inner.right) {
                 /* Wait until there's room in the semaphore for the chunk we're about to
-                process */
-                new_semaphore_acq_t sem_acq(
+                process.
+                We acquire the maximum size that we want to put in this chunk first,
+                and then adjust the semaphore acquisition to the actual size of the
+                chunk later. */
+                new_semaphore_in_line_t sem_acq(
                     &parent->item_throttler, parent->intro.config.item_chunk_mem_size);
                 wait_interruptible(
                     sem_acq.acquisition_signal(), keepalive.get_drain_signal());
@@ -229,7 +267,7 @@ private:
                 subregion.inner.left = threshold.key();
 
                 /* Copy items from the store into `chunk` until the total size hits
-                `ITEM_CHUNK_SIZE`; we finish the backfill range; or we run out of
+                `item_chunk_mem_size`; we finish the backfill range; or we run out of
                 pre-items. */
 
                 backfill_item_seq_t<backfill_item_t> chunk(
@@ -258,10 +296,11 @@ private:
                     public:
                         consumer_t(
                                 backfill_item_seq_t<backfill_item_t> *_chunk,
-                                region_map_t<version_t> *_metainfo,
-                                const backfill_config_t *_config) :
-                            chunk(_chunk), metainfo(_metainfo), config(_config) { }
-                        continue_bool_t on_item(
+                                region_map_t<version_t> *_metainfo) :
+                            chunk(_chunk), metainfo(_metainfo) {
+                                guarantee(chunk->get_mem_size() == 0);
+                            }
+                        void on_item(
                                 const region_map_t<binary_blob_t> &item_metainfo,
                                 backfill_item_t &&item) THROWS_NOTHING {
                             rassert(key_range_t::right_bound_t(item.range.left) >=
@@ -269,20 +308,14 @@ private:
                             rassert(!item.range.is_empty());
                             on_metainfo(item_metainfo, item.range.right);
                             chunk->push_back(std::move(item));
-                            if (chunk->get_mem_size() < config->item_chunk_mem_size) {
-                                return continue_bool_t::CONTINUE;
-                            } else {
-                                return continue_bool_t::ABORT;
-                            }
                         }
-                        continue_bool_t on_empty_range(
+                        void on_empty_range(
                                 const region_map_t<binary_blob_t> &range_metainfo,
                                 const key_range_t::right_bound_t &new_threshold)
                                 THROWS_NOTHING {
                             rassert(new_threshold >= chunk->get_right_key());
                             on_metainfo(range_metainfo, new_threshold);
                             chunk->push_back_nothing(new_threshold);
-                            return continue_bool_t::CONTINUE;
                         }
                     private:
                         void on_metainfo(
@@ -305,11 +338,14 @@ private:
                         }
                         backfill_item_seq_t<backfill_item_t> *const chunk;
                         region_map_t<version_t> *const metainfo;
-                        backfill_config_t const *const config;
-                    } consumer(&chunk, &metainfo, &parent->intro.config);
+                    } consumer(&chunk, &metainfo);
+
+                    backfill_item_memory_tracker_t memory_tracker(
+                        parent->intro.config.item_chunk_mem_size);
 
                     parent->parent->store->send_backfill(
-                        parent->common_version.mask(subregion), &producer, &consumer,
+                        parent->common_version.mask(subregion),
+                        &producer, &consumer, &memory_tracker,
                         keepalive.get_drain_signal());
 
                     /* `producer` goes out of scope here, so it restores `pre_items` to
@@ -323,7 +359,7 @@ private:
                 information for the backfillee to have. */
                 if (!chunk.empty_domain()) {
                     /* Adjust for the fact that `chunk.get_mem_size()` isn't precisely
-                    equal to `ITEM_CHUNK_SIZE`, and then transfer the semaphore
+                    equal to `item_chunk_mem_size`, and then transfer the semaphore
                     ownership. */
                     sem_acq.change_count(chunk.get_mem_size());
                     parent->item_throttler_acq.transfer_in(std::move(sem_acq));

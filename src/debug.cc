@@ -1,9 +1,10 @@
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "debug.hpp"
 
 #include <inttypes.h>
 
 #include "arch/runtime/runtime.hpp"
-#include "rdb_protocol/ql2.pb.h"
+#include "rdb_protocol/ql2proto.hpp"
 #include "time.hpp"
 #include "utils.hpp"
 
@@ -48,7 +49,11 @@ void debugf_prefix_buf(printf_buffer_t *buf) {
 
     format_time(t, buf, local_or_utc_time_t::local);
 
-    buf->appendf(" Thread %" PRIi32 ": ", get_thread_id().threadnum);
+    if (in_thread_pool()) {
+        buf->appendf(" Thread %" PRIi32 ": ", get_thread_id().threadnum);
+    } else {
+        buf->appendf(" Foreign thread: ");
+    }
 }
 
 void debugf_dump_buf(printf_buffer_t *buf) {
@@ -93,10 +98,6 @@ debugf_in_dtor_t::debugf_in_dtor_t(const char *msg, ...) {
 
 debugf_in_dtor_t::~debugf_in_dtor_t() {
     debugf("%s", message.c_str());
-}
-
-void pb_print(DEBUG_VAR Term *t) {
-    debugf("%s\n", t->DebugString().c_str());
 }
 
 debug_timer_t::debug_timer_t(std::string _name)

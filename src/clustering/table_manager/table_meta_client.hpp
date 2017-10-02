@@ -33,29 +33,35 @@ is a bug, they will never be shown to the user. */
 class no_such_table_exc_t : public std::runtime_error {
 public:
     no_such_table_exc_t() :
-        std::runtime_error("there is no table with the given name / UUID") { }
+        std::runtime_error("There is no table with the given name / UUID.") { }
 };
 
 class ambiguous_table_exc_t : public std::runtime_error {
 public:
     ambiguous_table_exc_t() :
-        std::runtime_error("there are multiple tables with the given name") { }
+        std::runtime_error("There are multiple tables with the given name.") { }
 };
 
 class failed_table_op_exc_t : public std::runtime_error {
 public:
-    failed_table_op_exc_t() : std::runtime_error("the attempt to read or modify the "
-        "table's configuration failed because none of the servers were accessible. if "
+    failed_table_op_exc_t() : std::runtime_error("The attempt to read or modify the "
+        "table's configuration failed because none of the servers were accessible.  If "
         "it was an attempt to modify, the modification did not take place.") { }
 };
 
 class maybe_failed_table_op_exc_t : public std::runtime_error {
 public:
-    maybe_failed_table_op_exc_t() : std::runtime_error("the attempt to modify the "
+    maybe_failed_table_op_exc_t() : std::runtime_error("The attempt to modify the "
         "table's configuration failed because we lost contact with the servers after "
         "initiating the modification, or the Raft leader lost contact with its "
-        "followers, or we timed out while waiting for the changes to propagate. the "
+        "followers, or we timed out while waiting for the changes to propagate.  The "
         "modification may or may not have taken place.") { }
+};
+
+class config_change_exc_t : public std::runtime_error {
+public:
+    config_change_exc_t() : std::runtime_error("The change could not be applied to the "
+        "table's configuration.") { }
 };
 
 /* `table_meta_client_t` is responsible for submitting client requests over the network
@@ -91,8 +97,7 @@ public:
     bool exists(const database_id_t &database, const name_string_t &name);
 
     /* `get_name()` determines the name, database, and primary key of the table with the
-    given ID; it's the reverse of `find()`. It returns `false` if there is no existing
-    table with that ID. `get_name()` will not block. */
+    given ID; it's the reverse of `find()`. It will not block. */
     void get_name(
         const namespace_id_t &table_id,
         table_basic_config_t *basic_config_out)
@@ -120,20 +125,42 @@ public:
         std::map<namespace_id_t, table_basic_config_t> *disconnected_configs_out)
         THROWS_ONLY(interrupted_exc_t);
 
-    /* `get_status()` returns detailed information about the table with the given ID:
-      - A list of the secondary indexes on the table and the status of each one.
-      - For each server, the server's Raft state and contract acks.
-      - The name of each server in `server_statuses_out`.
-      - Which server has the most up-to-date Raft state.
-    It may block. */
-    void get_status(
+    /* `get_sindex_status()` returns a list of the sindexes on the given table and the
+    status of each one. */
+    void get_sindex_status(
         const namespace_id_t &table_id,
         signal_t *interruptor,
         std::map<std::string, std::pair<sindex_config_t, sindex_status_t> >
-            *index_statuses_out,
-        std::map<server_id_t, table_server_status_t> *server_statuses_out,
-        server_name_map_t *server_names_out,
-        server_id_t *latest_server_out)
+            *index_statuses_out)
+        THROWS_ONLY(interrupted_exc_t, no_such_table_exc_t, failed_table_op_exc_t);
+
+    /* `get_shard_status()` returns some of the information necessary to fill in the
+    `rethinkdb.table_status` system table. If `server_shards_out` is set to `nullptr`, it
+    that information will not be retrieved, which will improve performance. */
+    void get_shard_status(
+        const namespace_id_t &table_id,
+        all_replicas_ready_mode_t all_replicas_ready_mode,
+        signal_t *interruptor,
+        std::map<server_id_t, range_map_t<key_range_t::right_bound_t,
+            table_shard_status_t> > *shard_statuses_out,
+        bool *all_replicas_ready_out)
+        THROWS_ONLY(interrupted_exc_t, no_such_table_exc_t, failed_table_op_exc_t);
+
+    /* `get_raft_leader()` fetches raft leader from the table directory.
+    This is for displaying raft information in `rethinkdb.table_status`. */
+    void get_raft_leader(
+        const namespace_id_t &table_id,
+        signal_t *interruptor,
+        optional<server_id_t> *raft_leader_out)
+        THROWS_ONLY(interrupted_exc_t, no_such_table_exc_t, failed_table_op_exc_t);
+
+    /* `get_debug_status()` fetches all status information from all servers. This is for
+    displaying in `rethinkdb._debug_table_status`. */
+    void get_debug_status(
+        const namespace_id_t &table_id,
+        all_replicas_ready_mode_t all_replicas_ready_mode,
+        signal_t *interruptor,
+        std::map<server_id_t, table_status_response_t> *responses_out)
         THROWS_ONLY(interrupted_exc_t, no_such_table_exc_t, failed_table_op_exc_t);
 
     /* `create()` creates a table with the given configuration. It sets `*table_id_out`
@@ -157,21 +184,21 @@ public:
     block. If it returns successfully, the change will be visible in `find()`, etc. */
     void set_config(
         const namespace_id_t &table_id,
-        const table_config_and_shards_t &new_config,
+        const table_config_and_shards_change_t &table_config_and_shards_change,
         signal_t *interruptor)
         THROWS_ONLY(interrupted_exc_t, no_such_table_exc_t, failed_table_op_exc_t,
-            maybe_failed_table_op_exc_t);
+            maybe_failed_table_op_exc_t, config_change_exc_t);
 
     /* `emergency_repair()` performs an emergency repair operation on the given table,
     creating a new table epoch. If all of the replicas for a given shard are missing, it
-    will leave the shard alone if `allow_data_loss` is `true`, or replace the shard with
-    a new empty shard if `allow_data_loss` is `false`. If `dry_run` is `true` it will
+    will leave the shard alone if `allow_erase` is `false`, or replace the shard with
+    a new empty shard if `allow_erase` is `true`. If `dry_run` is `true` it will
     compute the repair operation but not actually apply it. `simple_errors_found_out`
     and `data_loss_found_out` will indicate whether the two types of errors were
     detected. */
     void emergency_repair(
         const namespace_id_t &table_id,
-        bool allow_erase,
+        emergency_repair_mode_t mode,
         bool dry_run,
         signal_t *interruptor,
         table_config_and_shards_t *new_config_out,
@@ -181,7 +208,7 @@ public:
             maybe_failed_table_op_exc_t);
 
 private:
-    typedef std::pair<table_basic_config_t, multi_table_manager_bcard_t::timestamp_t>
+    typedef std::pair<table_basic_config_t, multi_table_manager_timestamp_t>
         timestamped_basic_config_t;
 
     /* `create_or_emergency_repair()` factors out the common parts of `create()` and
@@ -189,10 +216,30 @@ private:
     void create_or_emergency_repair(
         const namespace_id_t &table_id,
         const table_raft_state_t &raft_state,
-        microtime_t epoch_timestamp,
+        const multi_table_manager_timestamp_t::epoch_t &epoch,
         signal_t *interruptor)
         THROWS_ONLY(interrupted_exc_t, failed_table_op_exc_t,
             maybe_failed_table_op_exc_t);
+
+    /* `get_status()` runs a status query. It can run for a specific table or every
+    table. If `servers` is `EVERY_SERVER`, it runs against every server for the table(s);
+    if `BEST_SERVER_ONLY`, it only runs against one server for each table, which will be
+    the most up-to-date server that can be found. If it fails to contact at least one
+    server for a given table, it calls `failure_callback()` on that table. If you specify
+    a particular table and that table doesn't exist, it throws `no_such_table_exc_t`. */
+    enum class server_selector_t { EVERY_SERVER, BEST_SERVER_ONLY };
+    void get_status(
+        const optional<namespace_id_t> &table,
+        const table_status_request_t &request,
+        server_selector_t servers,
+        signal_t *interruptor,
+        const std::function<void(
+            const server_id_t &server,
+            const namespace_id_t &table,
+            const table_status_response_t &response
+            )> &callback,
+        std::set<namespace_id_t> *failures_out)
+        THROWS_ONLY(interrupted_exc_t);
 
     /* `retry()` calls `fun()` repeatedly. If `fun()` fails with a
     `failed_table_op_exc_t` or `maybe_failed_table_op_exc_t`, then `retry()` catches the

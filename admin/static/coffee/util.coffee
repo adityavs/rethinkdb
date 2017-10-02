@@ -157,6 +157,16 @@ approximate_count = (num) ->
 
 Handlebars.registerHelper 'approximate_count', approximate_count
 
+# formatBytes
+# from http://stackoverflow.com/a/18650828/180718
+format_bytes = (bytes, decimals=1) ->
+    if bytes == 0
+        return '0 Bytes'
+    k = 1024
+    sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB']
+    i = Math.floor(Math.log(bytes) / Math.log(k))
+    (bytes / Math.pow(k, i)).toFixed(decimals) + ' ' + sizes[i]
+
 # Safe string
 Handlebars.registerHelper 'print_safe', (str) ->
     if str?
@@ -259,7 +269,9 @@ date_to_string = (date) ->
     return raw_date_str.slice(0, raw_date_str.indexOf('GMT')+3)+timezone
 
 prettify_duration = (duration) ->
-    if duration < 1
+    if duration is null
+        return ''
+    else if duration < 1
         return '<1ms'
     else if duration < 1000
         return duration.toFixed(0)+"ms"
@@ -412,6 +424,41 @@ json_to_node = do ->
                 value: if value then 'true' else 'false'
 
 
+replica_rolename = ({configured_primary: configured, \
+                     currently_primary: currently, \
+                     nonvoting: nonvoting, \
+                     }) ->
+    if configured and currently
+        "Primary replica"
+    else if configured and not currently
+        "Goal primary replica"
+    else if not configured and currently
+        "Acting primary replica"
+    else if nonvoting
+        "Non-voting secondary replica"
+    else
+        "Secondary replica"
+
+replica_roleclass = ({configured_primary: configured, \
+                      currently_primary: currently}) ->
+    if configured and currently
+        "primary"
+    else if configured and not currently
+        "goal.primary"
+    else if not configured and currently
+        "acting.primary"
+    else
+        "secondary"
+
+state_color = (state) ->
+  switch state
+      when "ready"        then "green"
+      when "disconnected" then "red"
+      else                     "yellow"
+
+humanize_state_string = (state_string) ->
+    state_string.replace(/_/g, ' ')
+
 exports.capitalize = capitalize
 exports.humanize_table_status = humanize_table_status
 exports.form_data_as_object = form_data_as_object
@@ -426,3 +473,8 @@ exports.approximate_count = approximate_count
 exports.pluralize_noun = pluralize_noun
 exports.pluralize_verb = pluralize_verb
 exports.humanize_uuid = humanize_uuid
+exports.replica_rolename = replica_rolename
+exports.replica_roleclass = replica_roleclass
+exports.state_color = state_color
+exports.humanize_state_string = humanize_state_string
+exports.format_bytes = format_bytes

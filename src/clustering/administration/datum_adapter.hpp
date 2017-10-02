@@ -6,9 +6,11 @@
 #include <string>
 #include <vector>
 
+#include "clustering/administration/admin_op_exc.hpp"
 #include "containers/name_string.hpp"
 #include "rdb_protocol/context.hpp"
 #include "rdb_protocol/datum.hpp"
+#include "rpc/connectivity/server_id.hpp"
 #include "time.hpp"
 
 class cluster_semilattice_metadata_t;
@@ -29,7 +31,7 @@ ql::datum_t convert_string_to_datum(
 bool convert_string_from_datum(
         const ql::datum_t &datum,
         std::string *value_out,
-        std::string *error_out);
+        admin_err_t *error_out);
 
 ql::datum_t convert_name_to_datum(
         const name_string_t &value);
@@ -37,18 +39,30 @@ bool convert_name_from_datum(
         ql::datum_t datum,
         const std::string &what,   /* e.g. "server name" or "table name" */
         name_string_t *value_out,
-        std::string *error_out);
+        admin_err_t *error_out);
 
 ql::datum_t convert_uuid_to_datum(
         const uuid_u &value);
 bool convert_uuid_from_datum(
         ql::datum_t datum,
         uuid_u *value_out,
-        std::string *error_out);
+        admin_err_t *error_out);
 
 ql::datum_t convert_name_or_uuid_to_datum(
         const name_string_t &name,
         const uuid_u &uuid,
+        admin_identifier_format_t identifier_format);
+
+ql::datum_t convert_server_id_to_datum(
+        const server_id_t &value);
+bool convert_server_id_from_datum(
+        ql::datum_t datum,
+        server_id_t *value_out,
+        admin_err_t *error_out);
+
+ql::datum_t convert_name_or_server_id_to_datum(
+        const name_string_t &name,
+        const server_id_t &sid,
         admin_identifier_format_t identifier_format);
 
 /* If the given server is connected, sets `*server_name_or_uuid_out` to a datum
@@ -89,7 +103,7 @@ bool convert_database_id_from_datum(
         const cluster_semilattice_metadata_t &metadata,
         database_id_t *db_id_out,
         name_string_t *db_name_out,
-        std::string *error_out);
+        admin_err_t *error_out);
 
 ql::datum_t convert_port_to_datum(
         uint16_t value);
@@ -111,12 +125,14 @@ ql::datum_t convert_vector_to_datum(
 
 template<class T>
 bool convert_vector_from_datum(
-        const std::function<bool(ql::datum_t, T*, std::string*)> &conv,
+        const std::function<bool(ql::datum_t, T *, admin_err_t *)> &conv,
         ql::datum_t datum,
         std::vector<T> *vector_out,
-        std::string *error_out) {
+        admin_err_t *error_out) {
     if (datum.get_type() != ql::datum_t::R_ARRAY) {
-        *error_out = "Expected an array, got " + datum.print();
+        *error_out = admin_err_t{
+            "Expected an array, got " + datum.print(),
+            query_state_t::FAILED};
         return false;
     }
     vector_out->resize(datum.arr_size());
@@ -142,13 +158,15 @@ ql::datum_t convert_set_to_datum(
 
 template<class T>
 bool convert_set_from_datum(
-        const std::function<bool(ql::datum_t, T*, std::string*)> &conv,
+        const std::function<bool(ql::datum_t, T *, admin_err_t *)> &conv,
         bool allow_duplicates,
         ql::datum_t datum,
         std::set<T> *set_out,
-        std::string *error_out) {
+        admin_err_t *error_out) {
     if (datum.get_type() != ql::datum_t::R_ARRAY) {
-        *error_out = "Expected an array, got " + datum.print();
+        *error_out = admin_err_t{
+            "Expected an array, got " + datum.print(),
+            query_state_t::FAILED};
         return false;
     }
     set_out->clear();
@@ -159,7 +177,9 @@ bool convert_set_from_datum(
         }
         auto res = set_out->insert(value);
         if (!allow_duplicates && !res.second) {
-            *error_out = datum.get(i).print() + " was specified more than once.";
+            *error_out = admin_err_t{
+                datum.get(i).print() + " was specified more than once.",
+                query_state_t::FAILED};
             return false;
         }
     }
@@ -177,14 +197,14 @@ user passes an object with an invalid key. */
 class converter_from_datum_object_t {
 public:
     bool init(ql::datum_t datum,
-              std::string *error_out);
+              admin_err_t *error_out);
     bool get(const char *key,
              ql::datum_t *value_out,
-             std::string *error_out);
+             admin_err_t *error_out);
     void get_optional(const char *key,
                       ql::datum_t *value_out);
     bool has(const char *key);
-    bool check_no_extra_keys(std::string *error_out);
+    bool check_no_extra_keys(admin_err_t *error_out);
 private:
     ql::datum_t datum;
     std::set<datum_string_t> extra_keys;

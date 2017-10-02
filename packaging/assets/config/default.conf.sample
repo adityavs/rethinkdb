@@ -19,6 +19,7 @@
 # rungroup=rethinkdb
 
 ## Stash the pid in this file when the process is running
+## Note for systemd users: Systemd uses its own internal mechanism. Do not set this parameter.
 ## Command line default: none
 ## Init script default: /var/run/rethinkdb/<name>/pid_file (where <name> is the name of this config file without the extension)
 # pid-file=/var/run/rethinkdb/rethinkdb.pid
@@ -100,3 +101,15 @@
 ## The name for this server (as will appear in the metadata).
 ## If not specified, it will be randomly chosen from a short list of names.
 # server-name=server1
+
+## tls
+
+## Path to tls key/cert for http interface
+## Default: disabled
+# http-tls-key=key.pem
+# http-tls-cert=cert.pem
+
+## Path to tls key/cert for driver interface (Default: disabled)
+## Default: disabled
+# driver-tls-cert=cert.pem
+# driver-tls-key=key.pem

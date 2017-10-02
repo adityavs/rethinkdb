@@ -18,7 +18,7 @@ defaults () {
     ssh_key_name=
 
     # See http://cloud-images.ubuntu.com/locator/ec2/ for a list of official Ubuntu AMI
-    base_ami=ami-8caa1ce4 # Ubuntu Trusty 14.04 amd64 ebs 20140927
+    base_ami=ami-cf35f3a4 # Ubuntu Trusty 14.04 amd64 hvm:ebs 20150629
 }
 
 parseopts () {
@@ -42,7 +42,7 @@ main () {
     key=$(find_usable_key)
     echo "Using key $key"
     local instance_id instance_address
-    launch_instance_ephemeral "$base_ami" "$ssh_only_group" t1.micro "$key" instance_id instance_address
+    launch_instance_ephemeral "$base_ami" "$ssh_only_group" m3.medium "$key" instance_id instance_address
 
     scp_to "$instance_address" "$setup_files" "/tmp/build-ami"
     run "$instance_address" 'cd /tmp/build-ami && sudo bash setup.sh'
@@ -104,8 +104,8 @@ create_rethinkdb_ami () {
 
 check_env () {
     [ -n "${EC2_URL:-}" ] || error "\$EC2_URL must contain the ec2 region url (e.g. https://ec2.us-east-1.amazonaws.com)"
-    [ -n "${EC2_PRIVATE_KEY:-}" ] || error "\$EC2_PRIVATE_KEY must contain the path to your ec2 private key file"
-    [ -n "${EC2_CERT:-}" ] || error "\$EC2_CERT must contain the path to your ec2 certificate"
+    [ -n "${AWS_SECRET_KEY:-}" ] || error "\$AWS_SECRET_KEY must contain your AWS secret key"
+    [ -n "${AWS_ACCESS_KEY:-}" ] || error "\$AWS_ACCESS_KEY must contain your AWS access key"
     [ -n "${SSH_AUTH_SOCK:-}" ] || error "ssh-agent must be setup and loaded with your ec2 ssh key"
 }
 

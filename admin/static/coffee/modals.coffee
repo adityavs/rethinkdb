@@ -9,6 +9,7 @@ driver = app.driver
 system_db = app.system_db
 
 r = require('rethinkdb')
+Handlebars = require('hbsfy/runtime')
 
 class AddDatabaseModal extends ui_modals.AbstractModal
     template: require('../handlebars/add_database-modal.hbs')
@@ -190,9 +191,9 @@ class AddTableModal extends ui_modals.AbstractModal
         else
             # TODO Add durability in the query when the API will be available
             if @formdata.write_disk is 'yes'
-                durability = 'soft'
-            else
                 durability = 'hard'
+            else
+                durability = 'soft'
 
             if @formdata.primary_key isnt ''
                 primary_key = @formdata.primary_key
@@ -200,7 +201,8 @@ class AddTableModal extends ui_modals.AbstractModal
                 primary_key = 'id'
 
 
-            query = r.db(system_db).table("server_status").filter({status: "connected"}).coerceTo("ARRAY").do (servers) =>
+            query = r.db(system_db).table("server_status").coerceTo("ARRAY")
+              .do (servers) =>
                 r.branch(
                     servers.isEmpty(),
                     r.error("No server is connected"),
@@ -211,6 +213,7 @@ class AddTableModal extends ui_modals.AbstractModal
                             db: @db_name
                             name: @formdata.name
                             primary_key: primary_key
+                            durability
                             shards: [
                                 primary_replica: server
                                 replicas: [server]
@@ -290,7 +293,10 @@ class RemoveTableModal extends ui_modals.AbstractModal
         super
 
         # Build feedback message
-        message = "The tables "
+        if @tables_to_delete.length is 1
+            message = "The table "
+        else
+            message = "The tables "
         for table, index in @tables_to_delete
             message += "#{table.database}.#{table.table}"
             if index < @tables_to_delete.length-1
@@ -414,6 +420,8 @@ class ReconfigureModal extends ui_modals.AbstractModal
         @diff_view = new table_view.ReconfigureDiffView
             model: @model
             el: @$('.reconfigure-diff')[0]
+        if @get_errors()
+            @change_errors()
         @
 
     change_errors: =>
@@ -429,7 +437,8 @@ class ReconfigureModal extends ui_modals.AbstractModal
             for error in errors
                 message = @$(".alert.error p.error.#{error}").addClass('shown')
                 if error == 'server-error'
-                    @$('.alert.error .server-msg').append(Handlebars.Utils.escapeExpression(@model.get('server_error')))
+                    @$('.alert.error .server-msg').append(
+                        Handlebars.Utils.escapeExpression(@model.get('server_error')))
         else
             @error_on_empty = false
             @$('.btn.btn-primary').removeAttr 'disabled'
@@ -496,6 +505,8 @@ class ReconfigureModal extends ui_modals.AbstractModal
         driver.run_once query, (error, result) =>
             if error?
                 @model.set server_error: error.msg
+            else if result.first_error?
+                @model.set server_error: result.first_error
             else
                 @reset_buttons()
                 @remove()
@@ -519,11 +530,15 @@ class ReconfigureModal extends ui_modals.AbstractModal
         num_servers = @model.get('num_servers')
         num_default_servers = @model.get('num_default_servers')
 
+        MAX_NUM_SHARDS = 64
+
         # check shard errors
         if num_shards == 0
             errors.push 'zero-shards'
         else if isNaN num_shards
             errors.push 'no-shards'
+        else if num_shards > MAX_NUM_SHARDS
+            errors.push 'too-many-shards-hard-limit'
         else if num_shards > num_default_servers
             if num_shards > num_servers
                 errors.push 'too-many-shards'
@@ -582,7 +597,7 @@ class ReconfigureModal extends ui_modals.AbstractModal
                             .concatMap (server) -> [
                                 server,
                                 r.db(system_db).table('server_status')
-                                    .filter(name: server)(0)('id')
+                                    .filter(name: server)(0)('id').default(null)
                             ]
                     ))
             )

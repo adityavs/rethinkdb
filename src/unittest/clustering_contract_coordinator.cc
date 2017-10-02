@@ -52,6 +52,7 @@ public:
         cs.config.basic.primary_key = "id";
         cs.config.write_ack_config = write_ack_config_t::MAJORITY;
         cs.config.durability = write_durability_t::HARD;
+        cs.config.user_data = default_user_data();
 
         key_range_t::right_bound_t prev_right(store_key_t::min());
         for (const quick_shard_args_t &qs : qss) {
@@ -120,7 +121,7 @@ public:
         guarantee(st == contract_ack_t::state_t::secondary_need_primary);
         for (size_t i = 0; i < CPU_SHARDING_FACTOR; ++i) {
             contract_ack_t ack(st);
-            ack.version = boost::make_optional(quick_cpu_version_map(i, version));
+            ack.version.set(quick_cpu_version_map(i, version));
             ack.branch_history = branch_history;
             acks[contracts.contract_ids[i]][server] = ack;
         }
@@ -134,7 +135,7 @@ public:
         guarantee(st == contract_ack_t::state_t::primary_need_branch);
         for (size_t i = 0; i < CPU_SHARDING_FACTOR; ++i) {
             contract_ack_t ack(st);
-            ack.branch = boost::make_optional(branch->branch_ids[i]);
+            ack.branch.set(branch->branch_ids[i]);
             ack.branch_history = branch_history;
             acks[contracts.contract_ids[i]][server] = ack;
         }
@@ -180,12 +181,11 @@ public:
         std::set<contract_id_t> remove_contracts;
         std::map<contract_id_t, std::pair<region_t, contract_t> > add_contracts;
         std::map<region_t, branch_id_t> register_current_branches;
-        calculate_all_contracts(state, acks, &connections,
-            &remove_contracts, &add_contracts, &register_current_branches);
         std::set<branch_id_t> remove_branches;
         branch_history_t add_branches;
-        calculate_branch_history(state, acks, remove_contracts, add_contracts,
-            register_current_branches, &remove_branches, &add_branches);
+        calculate_all_contracts(state, acks, &connections,
+            &remove_contracts, &add_contracts, &register_current_branches,
+            &remove_branches, &add_branches);
         for (const contract_id_t &id : remove_contracts) {
             state.contracts.erase(id);
             acks.erase(id);
@@ -225,13 +225,25 @@ public:
                 const contract_t &actual = pair.second.second;
                 EXPECT_EQ(expect.replicas, actual.replicas);
                 EXPECT_EQ(expect.voters, actual.voters);
-                EXPECT_EQ(expect.temp_voters, actual.temp_voters);
+                // Compare the optional in two steps, to avoid #4257
+                EXPECT_EQ(static_cast<bool>(expect.temp_voters),
+                    static_cast<bool>(actual.temp_voters));
+                if (static_cast<bool>(expect.temp_voters) &&
+                        static_cast<bool>(actual.temp_voters)) {
+                    EXPECT_EQ(*expect.temp_voters, *actual.temp_voters);
+                }
                 EXPECT_EQ(static_cast<bool>(expect.primary),
                     static_cast<bool>(actual.primary));
                 if (static_cast<bool>(expect.primary) &&
                         static_cast<bool>(actual.primary)) {
                     EXPECT_EQ(expect.primary->server, actual.primary->server);
-                    EXPECT_EQ(expect.primary->hand_over, actual.primary->hand_over);
+                    // Again, two-step comparison of optional to avoid #4257
+                    EXPECT_EQ(static_cast<bool>(expect.primary->hand_over),
+                        static_cast<bool>(actual.primary->hand_over));
+                    if (static_cast<bool>(expect.primary->hand_over) &&
+                            static_cast<bool>(actual.primary->hand_over)) {
+                        EXPECT_EQ(*expect.primary->hand_over, *actual.primary->hand_over);
+                    }
                 }
             }
         }
@@ -283,7 +295,8 @@ public:
 
 /* In the `AddReplica` test, we add a single replica to a table. */
 TPTEST(ClusteringContractCoordinator, AddReplica) {
-    server_id_t alice = generate_uuid(), billy = generate_uuid();
+    server_id_t alice = server_id_t::generate_server_id();
+    server_id_t billy = server_id_t::generate_server_id();
     coordinator_tester_t test({ alice, billy });
     test.set_config({ {"*-*", {alice}, alice} });
     cpu_branch_ids_t branch = quick_cpu_branch(
@@ -323,7 +336,8 @@ TPTEST(ClusteringContractCoordinator, AddReplica) {
 
 /* In the `RemoveReplica` test, we remove a single replica from a table. */
 TPTEST(ClusteringContractCoordinator, RemoveReplica) {
-    server_id_t alice = generate_uuid(), billy = generate_uuid();
+    server_id_t alice = server_id_t::generate_server_id();
+    server_id_t billy = server_id_t::generate_server_id();
     coordinator_tester_t test({ alice, billy });
     test.set_config({ {"*-*", {alice, billy}, alice} });
     cpu_branch_ids_t branch = quick_cpu_branch(
@@ -356,7 +370,8 @@ TPTEST(ClusteringContractCoordinator, RemoveReplica) {
 
 /* In the `ChangePrimary` test, we move the primary from one replica to another. */
 TPTEST(ClusteringContractCoordinator, ChangePrimary) {
-    server_id_t alice = generate_uuid(), billy = generate_uuid();
+    server_id_t alice = server_id_t::generate_server_id();
+    server_id_t billy = server_id_t::generate_server_id();
     coordinator_tester_t test({ alice, billy });
     test.set_config({ {"*-*", {alice, billy}, alice} });
     cpu_branch_ids_t branch1 = quick_cpu_branch(
@@ -416,7 +431,8 @@ TPTEST(ClusteringContractCoordinator, ChangePrimary) {
 
 /* In the `Split` test, we break a shard into two sub-shards. */
 TPTEST(ClusteringContractCoordinator, Split) {
-    server_id_t alice = generate_uuid(), billy = generate_uuid();
+    server_id_t alice = server_id_t::generate_server_id();
+    server_id_t billy = server_id_t::generate_server_id();
     coordinator_tester_t test({ alice, billy });
     test.set_config({ {"*-*", {alice}, alice} });
     cpu_branch_ids_t branch1 = quick_cpu_branch(
@@ -509,9 +525,9 @@ TPTEST(ClusteringContractCoordinator, Split) {
 /* In the `Failover` test, we test that a new primary will be elected if the old primary
 fails. */
 TPTEST(ClusteringContractCoordinator, Failover) {
-    server_id_t alice = generate_uuid(),
-                billy = generate_uuid(),
-                carol = generate_uuid();
+    server_id_t alice = server_id_t::generate_server_id(),
+                billy = server_id_t::generate_server_id(),
+                carol = server_id_t::generate_server_id();
     coordinator_tester_t test({ alice, billy, carol });
     test.set_config({ {"*-*", {alice, billy, carol}, alice} });
     cpu_branch_ids_t branch1 = quick_cpu_branch(
@@ -561,9 +577,9 @@ TPTEST(ClusteringContractCoordinator, Failover) {
 /* In the `FailoverSplit` test, we test a corner case where different servers are
 eligile to be primary for different parts of the new key-space. */
 TPTEST(ClusteringContractCoordinator, FailoverSplit) {
-    server_id_t alice = generate_uuid(),
-                billy = generate_uuid(),
-                carol = generate_uuid();
+    server_id_t alice = server_id_t::generate_server_id(),
+                billy = server_id_t::generate_server_id(),
+                carol = server_id_t::generate_server_id();
     coordinator_tester_t test({ alice, billy, carol });
     test.set_config({ {"*-*", {alice, billy, carol}, alice} });
     cpu_branch_ids_t branch1 = quick_cpu_branch(

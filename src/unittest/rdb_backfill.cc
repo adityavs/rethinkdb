@@ -1,17 +1,18 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "unittest/gtest.hpp"
 
+#include "btree/backfill_debug.hpp"
 #include "clustering/administration/metadata.hpp"
 #include "clustering/immediate_consistency/backfill_throttler.hpp"
 #include "clustering/immediate_consistency/local_replicator.hpp"
 #include "clustering/immediate_consistency/primary_dispatcher.hpp"
 #include "clustering/immediate_consistency/remote_replicator_client.hpp"
 #include "clustering/immediate_consistency/remote_replicator_server.hpp"
+#include "clustering/table_manager/backfill_progress_tracker.hpp"
 #include "extproc/extproc_pool.hpp"
 #include "extproc/extproc_spawner.hpp"
 #include "rapidjson/document.h"
 #include "rdb_protocol/minidriver.hpp"
-#include "rdb_protocol/pb_utils.hpp"
 #include "rdb_protocol/env.hpp"
 #include "rdb_protocol/protocol.hpp"
 #include "rdb_protocol/store.hpp"
@@ -46,72 +47,78 @@ std::string read_from_dispatcher(
         EXPECT_EQ(key, get_result.data.get_field("id").as_str().to_std());
         EXPECT_EQ(std::string(value_padding_length, 'a'),
             get_result.data.get_field("padding").as_str().to_std());
-        return get_result.data.get_field("value").as_str().to_std();
+        std::string value = get_result.data.get_field("value").as_str().to_std();
+        backfill_debug_key(store_key_t(key), "read \"" + value + "\"");
+        return value;
     } else {
+        backfill_debug_key(store_key_t(key), "read (absent)");
         return "";
     }
 }
 
-class dispatcher_inserter_t {
+class dispatcher_inserter_t : public test_inserter_t {
 public:
     dispatcher_inserter_t(
             primary_dispatcher_t *_dispatcher,
             order_source_t *order_source,
             size_t _value_padding_length,
             std::map<std::string, std::string> *inserter_state,
-            bool start = true) :
+            bool should_start = true) :
+        test_inserter_t(order_source, "dispatcher_inserter_t", inserter_state),
         dispatcher(_dispatcher),
-        value_padding_length(_value_padding_length),
-        inner(
-            std::bind(&dispatcher_inserter_t::write, this,
-                ph::_1, ph::_2, ph::_3, ph::_4),
-            std::bind(&dispatcher_inserter_t::read, this, ph::_1, ph::_2, ph::_3),
-            []() { return alpha_key_gen(20); },
-            order_source,
-            "dispatcher_inserter_t",
-            inserter_state,
-            start)
-        { }
-    void insert(size_t n) { inner.insert(n); }
-    void start() { inner.start(); }
-    void stop() { inner.stop(); }
-    void validate() { inner.validate(); }
-    void validate_no_extras(const std::map<std::string, std::string> &extras) {
-        inner.validate_no_extras(extras);
+        value_padding_length(_value_padding_length)
+    {
+        if (should_start) {
+            this->start();
+        }
+    }
+    ~dispatcher_inserter_t() {
+        if (running()) {
+            stop();
+        }
     }
 private:
     void write(const std::string &key, const std::string &value,
             order_token_t otok, signal_t *interruptor) {
-        write_t write;
+        write_t _write;
         if (!value.empty()) {
             ql::datum_object_builder_t doc;
             doc.overwrite("id", ql::datum_t(datum_string_t(key)));
             doc.overwrite("value", ql::datum_t(datum_string_t(value)));
             doc.overwrite("padding", ql::datum_t(datum_string_t(
                 std::string(value_padding_length, 'a'))));
-            write = write_t(
+            _write = write_t(
                     point_write_t(store_key_t(key), std::move(doc).to_datum(), true),
                     DURABILITY_REQUIREMENT_SOFT,
                     profile_bool_t::PROFILE,
                     ql::configured_limits_t());
         } else {
-            write = write_t(
+            _write = write_t(
                     point_delete_t(store_key_t(key)),
                     DURABILITY_REQUIREMENT_SOFT,
                     profile_bool_t::PROFILE,
                     ql::configured_limits_t());
         }
         simple_write_callback_t write_callback;
-        dispatcher->spawn_write(write, otok, &write_callback);
+        dispatcher->spawn_write(_write, otok, &write_callback);
         wait_interruptible(&write_callback, interruptor);
     }
     std::string read(const std::string &key, order_token_t otok, signal_t *interruptor) {
         return read_from_dispatcher(
             dispatcher, value_padding_length, key, otok, interruptor);
     }
+    std::string generate_key() {
+        return alpha_key_gen(20);
+    }
+    void report_error(
+            const std::string &key,
+            const std::string &expect,
+            const std::string &actual) {
+        backfill_debug_dump_log(store_key_t(key));
+        test_inserter_t::report_error(key, expect, actual);
+    }
     primary_dispatcher_t *dispatcher;
     size_t value_padding_length;
-    test_inserter_t inner;
 };
 
 region_map_t<version_t> get_store_version_map(store_view_t *store) {
@@ -126,7 +133,6 @@ backfill_config_t unlimited_queues_config() {
     backfill_config_t c;
     c.item_queue_mem_size = GIGABYTE;
     c.pre_item_queue_mem_size = GIGABYTE;
-    c.write_queue_count = 1000000;
     return c;
 }
 
@@ -140,7 +146,9 @@ public:
         value_padding_length(100),
         num_initial_writes(500),
         num_step_writes(100),
-        stream_during_backfill(true)
+        stream_during_backfill(true),
+        min_preempt_ms(200),
+        max_preempt_ms(1000)
         { }
 
     /* `value_padding_length` is the amount of extra padding to add to each document, in
@@ -158,17 +166,61 @@ public:
     online writes during the backfill. */
     bool stream_during_backfill;
 
+    /* Each phase of the backfill will be allowed to run for a random time between
+    `min_preempt_ms` and `max_preempt_ms` before being preempted. */
+    int min_preempt_ms, max_preempt_ms;
+
     /* This controls the queue sizes, etc. in the backfill logic. */
     backfill_config_t backfill;
 };
 
+/* `stress_backfill_throttler_t` allows each backfill to run for a random amount of time
+before preempting it. */
+class stress_backfill_throttler_t : public backfill_throttler_t {
+public:
+    explicit stress_backfill_throttler_t(const backfill_test_config_t &_config) :
+        config(_config) { }
+    ~stress_backfill_throttler_t() {
+        guarantee(drainers.empty());
+    }
+
+private:
+    void enter(lock_t *lock, signal_t *) {
+        assert_thread();   /* this unit test is single-threaded */
+        drainers[lock].init(new auto_drainer_t);
+        auto_drainer_t::lock_t keepalive(drainers[lock].get());
+        coro_t::spawn_sometime([this, lock, keepalive   /* important to capture */]() {
+            try {
+                int time = config.min_preempt_ms +
+                    randint(config.max_preempt_ms - config.min_preempt_ms + 1);
+                nap(time, keepalive.get_drain_signal());
+                preempt(lock);
+            } catch (const interrupted_exc_t &) {
+                /* ignore */
+            }
+        });
+    }
+
+    void exit(lock_t *lock) {
+        assert_thread();
+        size_t res = drainers.erase(lock);
+        guarantee(res == 1);
+    }
+
+    backfill_test_config_t config;
+    std::map<lock_t *, scoped_ptr_t<auto_drainer_t> > drainers;
+};
+
 void run_backfill_test(const backfill_test_config_t &cfg) {
+
+    backfill_debug_clear_log();
 
     order_source_t order_source;
     simple_mailbox_cluster_t cluster;
     io_backender_t io_backender(file_direct_io_mode_t::buffered_desired);
     extproc_pool_t extproc_pool(2);
-    rdb_context_t ctx(&extproc_pool, NULL);
+    dummy_semilattice_controller_t<auth_semilattice_metadata_t> auth_manager;
+    rdb_context_t ctx(&extproc_pool, nullptr, auth_manager.get_view());
     cond_t non_interruptor;
 
     in_memory_branch_history_manager_t bhm;
@@ -184,13 +236,16 @@ void run_backfill_test(const backfill_test_config_t &cfg) {
             &get_global_perfmon_collection(),
             region_map_t<version_t>(region_t::universe(), version_t::zero()));
 
-        local_replicator_t local_replicator(cluster.get_mailbox_manager(),
-            generate_uuid(), &dispatcher, &store1.store, &bhm, &non_interruptor);
+        local_replicator_t local_replicator(
+            cluster.get_mailbox_manager(), server_id_t::generate_server_id(),
+            &dispatcher, &store1.store, &bhm, &non_interruptor);
 
         dispatcher_inserter_t inserter(
             &dispatcher, &order_source, cfg.value_padding_length, &first_inserter_state,
             false);
+        backfill_debug_all("begin insert store1");
         inserter.insert(cfg.num_initial_writes);
+        backfill_debug_all("end insert store1");
 
         /* Set up `store2` and `store3` as secondaries. Backfill and then wait some time,
         but then unsubscribe. */
@@ -203,17 +258,26 @@ void run_backfill_test(const backfill_test_config_t &cfg) {
                 cluster.get_mailbox_manager(),
                 &dispatcher);
 
-            backfill_throttler_t backfill_throttler;
+            stress_backfill_throttler_t backfill_throttler(cfg);
+            backfill_debug_all("begin backfill store1 -> store2");
+            backfill_progress_tracker_t backfill_progress_tracker;
             remote_replicator_client_t remote_replicator_client_2(&backfill_throttler,
-                cfg.backfill, cluster.get_mailbox_manager(), generate_uuid(),
+                cfg.backfill, &backfill_progress_tracker, cluster.get_mailbox_manager(),
+                server_id_t::generate_server_id(),
+                backfill_throttler_t::priority_t::critical_t::NO,
                 dispatcher.get_branch_id(), remote_replicator_server.get_bcard(),
-                local_replicator.get_replica_bcard(), &store2.store, &bhm,
-                &non_interruptor);
+                local_replicator.get_replica_bcard(), server_id_t::generate_server_id(),
+                &store2.store, &bhm, &non_interruptor);
+            backfill_debug_all("end backfill store1 -> store2");
+            backfill_debug_all("begin backfill store1 -> store3");
             remote_replicator_client_t remote_replicator_client_3(&backfill_throttler,
-                cfg.backfill, cluster.get_mailbox_manager(), generate_uuid(),
+                cfg.backfill, &backfill_progress_tracker, cluster.get_mailbox_manager(),
+                server_id_t::generate_server_id(),
+                backfill_throttler_t::priority_t::critical_t::NO,
                 dispatcher.get_branch_id(), remote_replicator_server.get_bcard(),
-                local_replicator.get_replica_bcard(), &store3.store, &bhm,
-                &non_interruptor);
+                local_replicator.get_replica_bcard(), server_id_t::generate_server_id(),
+                &store3.store, &bhm, &non_interruptor);
+            backfill_debug_all("end backfill store1 -> store3");
 
             if (cfg.stream_during_backfill) {
                 inserter.stop();
@@ -222,7 +286,9 @@ void run_backfill_test(const backfill_test_config_t &cfg) {
 
         /* Keep running writes on `store1` for a bit longer, so that `store1` will be
         ahead of `store2` and `store3`. */
+        backfill_debug_all("begin insert store1");
         inserter.insert(cfg.num_step_writes);
+        backfill_debug_all("end insert store1");
     }
 
     std::map<std::string, std::string> second_inserter_state;
@@ -233,8 +299,9 @@ void run_backfill_test(const backfill_test_config_t &cfg) {
             &get_global_perfmon_collection(),
             get_store_version_map(&store2.store));
 
-        local_replicator_t local_replicator(cluster.get_mailbox_manager(),
-            generate_uuid(), &dispatcher, &store2.store, &bhm, &non_interruptor);
+        local_replicator_t local_replicator(
+            cluster.get_mailbox_manager(), server_id_t::generate_server_id(),
+            &dispatcher, &store2.store, &bhm, &non_interruptor);
 
         /* Find the subset of `first_inserter_state` that's actually present in `store2`
         */
@@ -250,7 +317,9 @@ void run_backfill_test(const backfill_test_config_t &cfg) {
         dispatcher_inserter_t inserter(
             &dispatcher, &order_source, cfg.value_padding_length, &second_inserter_state,
             false);
+        backfill_debug_all("begin insert store2");
         inserter.insert(cfg.num_step_writes);
+        backfill_debug_all("end insert store2");
 
         if (cfg.stream_during_backfill) {
             inserter.start();
@@ -262,12 +331,17 @@ void run_backfill_test(const backfill_test_config_t &cfg) {
             cluster.get_mailbox_manager(),
             &dispatcher);
 
-        backfill_throttler_t backfill_throttler;
+        stress_backfill_throttler_t backfill_throttler(cfg);
+        backfill_debug_all("begin backfill store2 -> store1");
+        backfill_progress_tracker_t backfill_progress_tracker;
         remote_replicator_client_t remote_replicator_client(&backfill_throttler,
-            cfg.backfill, cluster.get_mailbox_manager(), generate_uuid(),
+            cfg.backfill, &backfill_progress_tracker, cluster.get_mailbox_manager(),
+            server_id_t::generate_server_id(),
+            backfill_throttler_t::priority_t::critical_t::NO,
             dispatcher.get_branch_id(), remote_replicator_server.get_bcard(),
-            local_replicator.get_replica_bcard(), &store1.store, &bhm,
-            &non_interruptor);
+            local_replicator.get_replica_bcard(), server_id_t::generate_server_id(),
+            &store1.store, &bhm, &non_interruptor);
+        backfill_debug_all("end backfill store2 -> store1");
 
         if (cfg.stream_during_backfill) {
             inserter.stop();
@@ -281,8 +355,9 @@ void run_backfill_test(const backfill_test_config_t &cfg) {
             &get_global_perfmon_collection(),
             get_store_version_map(&store1.store));
 
-        local_replicator_t local_replicator(cluster.get_mailbox_manager(),
-            generate_uuid(), &dispatcher, &store1.store, &bhm, &non_interruptor);
+        local_replicator_t local_replicator(
+            cluster.get_mailbox_manager(), server_id_t::generate_server_id(),
+            &dispatcher, &store1.store, &bhm, &non_interruptor);
 
         /* Validate the state of `store1` to make sure
         that the backfill was completely correct */
@@ -302,12 +377,17 @@ void run_backfill_test(const backfill_test_config_t &cfg) {
             cluster.get_mailbox_manager(),
             &dispatcher);
 
-        backfill_throttler_t backfill_throttler;
+        stress_backfill_throttler_t backfill_throttler(cfg);
+        backfill_debug_all("begin backfill store1 -> store3");
+        backfill_progress_tracker_t backfill_progress_tracker;
         remote_replicator_client_t remote_replicator_client(&backfill_throttler,
-            cfg.backfill, cluster.get_mailbox_manager(), generate_uuid(),
+            cfg.backfill, &backfill_progress_tracker, cluster.get_mailbox_manager(),
+            server_id_t::generate_server_id(),
+            backfill_throttler_t::priority_t::critical_t::NO,
             dispatcher.get_branch_id(), remote_replicator_server.get_bcard(),
-            local_replicator.get_replica_bcard(), &store3.store, &bhm,
-            &non_interruptor);
+            local_replicator.get_replica_bcard(), server_id_t::generate_server_id(),
+            &store3.store, &bhm, &non_interruptor);
+        backfill_debug_all("end backfill store1 -> store3");
 
         if (cfg.stream_during_backfill) {
             inserter.stop();
@@ -320,8 +400,9 @@ void run_backfill_test(const backfill_test_config_t &cfg) {
             &get_global_perfmon_collection(),
             get_store_version_map(&store3.store));
 
-        local_replicator_t local_replicator(cluster.get_mailbox_manager(),
-            generate_uuid(), &dispatcher, &store3.store, &bhm, &non_interruptor);
+        local_replicator_t local_replicator(
+            cluster.get_mailbox_manager(), server_id_t::generate_server_id(),
+            &dispatcher, &store3.store, &bhm, &non_interruptor);
 
         /* Validate the state of `store3` to make sure that the backfill was completely
         correct */
@@ -410,11 +491,13 @@ TPTEST(RDBBackfill, NearEmptyTable) {
 }
 
 TPTEST(RDBBackfill, FillItemQueue) {
-    /* Force the item queue to fill up, but make the other two queues unlimited. */
+    /* Force the item queue to fill up, but make the pre-item queue unlimited and never
+    preempt. */
     backfill_test_config_t cfg;
-    cfg.backfill = unlimited_queues_config();
     cfg.backfill.item_queue_mem_size = 1;
     cfg.backfill.item_chunk_mem_size = 1;
+    cfg.backfill.pre_item_queue_mem_size = GIGABYTE;
+    cfg.min_preempt_ms = cfg.max_preempt_ms = 60 * 60 * 1000;
     /* Since the item queue will stall a lot, this backfill will be much slower than
     normal; so we backfill fewer items to speed up the test. */
     cfg.num_initial_writes = 100;
@@ -423,10 +506,13 @@ TPTEST(RDBBackfill, FillItemQueue) {
 }
 
 TPTEST(RDBBackfill, FillPreItemQueue) {
-    /* Force the pre-item queue to fill up, but make the other two queues unlimited. */
+    /* Force the pre-item queue to fill up, but make the item queue unlimited and never
+    preempt. */
     backfill_test_config_t cfg;
     cfg.backfill.pre_item_queue_mem_size = 1;
     cfg.backfill.pre_item_chunk_mem_size = 1;
+    cfg.backfill.item_queue_mem_size = GIGABYTE;
+    cfg.min_preempt_ms = cfg.max_preempt_ms = 60 * 60 * 1000;
     /* Since the pre-item queue will stall a lot, this backfill will be much slower than
     normal; so we backfill fewer items to speed up the test. */
     cfg.num_initial_writes = 100;
@@ -434,22 +520,23 @@ TPTEST(RDBBackfill, FillPreItemQueue) {
     run_backfill_test(cfg);
 }
 
-TPTEST(RDBBackfill, FillWriteQueue) {
-    /* Force the write queue to fill up so that the backfill repeatedly switches between
-    streaming and backfilling modes. */
+TPTEST(RDBBackfill, PreemptOften) {
+    /* Force the backfill to be preempted after every single backfill item, just to
+    stress the system */
     backfill_test_config_t cfg;
-    cfg.backfill.write_queue_count = 3;
+    cfg.min_preempt_ms = cfg.max_preempt_ms = 0;
     run_backfill_test(cfg);
 }
 
-TPTEST(RDBBackfill, FillAllQueues) {
-    /* Make all the queues very small, just to stress the system. */
+TPTEST(RDBBackfill, FillBothQueuesAndPreemptOften) {
+    /* Make both the queues very small and also preempt often, just to stress the system.
+    */
     backfill_test_config_t cfg;
     cfg.backfill.item_queue_mem_size = 1;
     cfg.backfill.item_chunk_mem_size = 1;
     cfg.backfill.pre_item_queue_mem_size = 1;
     cfg.backfill.pre_item_chunk_mem_size = 1;
-    cfg.backfill.write_queue_count = 1;
+    cfg.min_preempt_ms = cfg.max_preempt_ms = 0;
     /* Speed up the test by backfilling fewer items */
     cfg.num_initial_writes = 100;
     cfg.num_step_writes = 10;

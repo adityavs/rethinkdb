@@ -3,9 +3,11 @@
 #define CLUSTERING_TABLE_MANAGER_MULTI_TABLE_MANAGER_HPP_
 
 #include "clustering/administration/perfmon_collection_repo.hpp"
-#include "clustering/immediate_consistency/backfill_throttler.hpp"
+#include "clustering/immediate_consistency/standard_backfill_throttler.hpp"
 #include "clustering/table_contract/cpu_sharding.hpp"
 #include "clustering/table_manager/table_manager.hpp"
+#include "concurrency/rwlock.hpp"
+#include "containers/optional.hpp"
 
 /* There is one `multi_table_manager_t` on each server. For tables hosted on this server,
 it handles administrative operations: table creation and deletion, adding and removing
@@ -63,7 +65,7 @@ the remaining servers' action mailboxes, so the table will finish being created.
 as though the table still exists, it will forward the drop message to that server's
 action mailbox. */
 
-class multi_table_manager_t {
+class multi_table_manager_t : public home_thread_mixin_t {
 public:
     multi_table_manager_t(
         const server_id_t &_server_id,
@@ -93,7 +95,7 @@ public:
     multi_table_manager_bcard_t get_multi_table_manager_bcard() {
         multi_table_manager_bcard_t bcard;
         bcard.action_mailbox = action_mailbox->get_address();
-        bcard.get_config_mailbox = get_config_mailbox->get_address();
+        bcard.get_status_mailbox = get_status_mailbox->get_address();
         bcard.server_id = server_id;
         return bcard;
     }
@@ -109,29 +111,41 @@ public:
     }
 
     watchable_map_t<namespace_id_t,
-            std::pair<table_basic_config_t, multi_table_manager_bcard_t::timestamp_t> >
+            std::pair<table_basic_config_t, multi_table_manager_timestamp_t> >
                 *get_table_basic_configs() {
         return &table_basic_configs;
     }
 
-    /* Calls `callable` for each table, it must have a signature of:
+    /* Calls `callable` for each active table, it must have a signature of:
            void(const namespace_id_t &table_id, multistore_ptr_t *, table_manager_t *)
+    `access` must be `access_t::write` if you change the state or configuration of
+    the table in the callback (but not for running queries). Otherwise
+    `access_t::read` is sufficient.
      */
     template <typename F>
-    void visit_tables(signal_t *interruptor, const F &callable) {
+    void visit_tables(signal_t *interruptor, access_t access, const F &callable) {
         /* Fetch information for all tables that we know about. First we get in line for
-        each mutex, then we release the global mutex assertion, then we wait for each
-        mutex to be ready and copy out its data. */
+        each rwlock, then we release the global mutex assertion, then we wait for each
+        rwlock acquisition to be ready and copy out its data. */
         mutex_assertion_t::acq_t global_mutex_acq(&mutex);
-        std::map<namespace_id_t, scoped_ptr_t<new_mutex_in_line_t> >
-            table_mutex_in_lines;
+        std::map<namespace_id_t, scoped_ptr_t<rwlock_in_line_t> >
+            table_lock_in_lines;
         for (const auto &pair : tables) {
-            table_mutex_in_lines[pair.first] =
-                make_scoped<new_mutex_in_line_t>(&pair.second->mutex);
+            table_lock_in_lines[pair.first] =
+                make_scoped<rwlock_in_line_t>(&pair.second->access_rwlock, access);
         }
         global_mutex_acq.reset();
-        for (const auto &pair : table_mutex_in_lines) {
-            wait_interruptible(pair.second->acq_signal(), interruptor);
+        for (const auto &pair : table_lock_in_lines) {
+            switch (access) {
+            case access_t::read:
+                wait_interruptible(pair.second->read_signal(), interruptor);
+                break;
+            case access_t::write:
+                wait_interruptible(pair.second->write_signal(), interruptor);
+                break;
+            default:
+                unreachable();
+            }
             auto it = tables.find(pair.first);
             guarantee(it != tables.end());
             if (it->second->status == table_t::status_t::ACTIVE) {
@@ -139,6 +153,44 @@ public:
                          it->second->multistore_ptr.get(),
                          &(it->second->active->manager));
             }
+        }
+    }
+
+    /* Calls `callable` on the specific table, if it's available. `callable`'s signature
+    must be:
+        void(multistore_ptr_t *, table_manager_t *)
+    If the table doesn't exist or is not active on this server, calls `callable` with
+    null pointers.
+    `access` must be `access_t::write` if you change the state or configuration of
+    the table in the callback (but not for running queries). Otherwise
+    `access_t::read` is sufficient.*/
+    template <typename F>
+    void visit_table(
+            const namespace_id_t &table_id, signal_t *interruptor, access_t access,
+            const F &callable) {
+        mutex_assertion_t::acq_t global_mutex_acq(&mutex);
+        auto it = tables.find(table_id);
+        if (it == tables.end()) {
+            callable(nullptr, nullptr);
+            return;
+        }
+        table_t *table = it->second.get();
+        rwlock_in_line_t lock_in_line(&table->access_rwlock, access);
+        global_mutex_acq.reset();
+        switch (access) {
+        case access_t::read:
+            wait_interruptible(lock_in_line.read_signal(), interruptor);
+            break;
+        case access_t::write:
+            wait_interruptible(lock_in_line.write_signal(), interruptor);
+            break;
+        default:
+            unreachable();
+        }
+        if (table->status == table_t::status_t::ACTIVE) {
+            callable(table->multistore_ptr.get(), &table->active->manager);
+        } else {
+            callable(nullptr, nullptr);
         }
     }
 
@@ -173,9 +225,10 @@ private:
             multi_table_manager_t *parent,
             table_t *table,
             const namespace_id_t &table_id,
-            const multi_table_manager_bcard_t::timestamp_t::epoch_t &epoch,
+            const multi_table_manager_timestamp_t::epoch_t &epoch,
             const raft_member_id_t &member_id,
             raft_storage_interface_t<table_raft_state_t> *raft_storage,
+            const raft_start_election_immediately_t start_election_immediately,
             multistore_ptr_t *multistore_ptr,
             perfmon_collection_t *perfmon_collection_namespace);
 
@@ -240,9 +293,9 @@ private:
         std::set<peer_id_t> to_sync_set;
         bool sync_coro_running;
 
-        /* You must hold this mutex to access the other fields of the `table_t` except
+        /* You must hold this lock to access the other fields of the `table_t` except
         for `to_sync_set` and `sync_coro_running` */
-        new_mutex_t mutex;
+        rwlock_t access_rwlock;
 
         status_t status;
 
@@ -253,7 +306,7 @@ private:
         holding `mutex`.) When `status` is `INACTIVE`, it's updated when we receive
         messages from other servers. */
         object_buffer_t<watchable_map_var_t<namespace_id_t,
-                std::pair<table_basic_config_t, multi_table_manager_bcard_t::timestamp_t>
+                std::pair<table_basic_config_t, multi_table_manager_timestamp_t>
                 >::entry_t>
             basic_configs_entry;
 
@@ -276,21 +329,11 @@ private:
 
     void on_action(
         signal_t *interruptor,
-        const namespace_id_t &table_id,
-        const multi_table_manager_bcard_t::timestamp_t &timestamp,
-        multi_table_manager_bcard_t::status_t status,
-        const boost::optional<table_basic_config_t> &basic_config,
-        const boost::optional<raft_member_id_t> &raft_member_id,
-        const boost::optional<raft_persistent_state_t<table_raft_state_t> >
-            &initial_raft_state,
-        const mailbox_t<void()>::address_t &ack_addr);
+        const multi_table_manager_bcard_t::action_message_t &msg);
 
-    void on_get_config(
+    void on_get_status(
         signal_t *interruptor,
-        const boost::optional<namespace_id_t> &table_id,
-        const mailbox_t<void(std::map<namespace_id_t, std::pair<
-                table_config_and_shards_t, multi_table_manager_bcard_t::timestamp_t>
-            >)>::address_t &reply_addr);
+        const multi_table_manager_bcard_t::get_status_message_t &msg);
 
     /* `do_sync()` checks if it is necessary to send an action message to the given
     server regarding the given table, and sends one if so. It is called in the following
@@ -309,7 +352,7 @@ private:
         const server_id_t &server_id,
         /* This is the other server's directory entry for this table, or an empty
         optional if there is no entry. */
-        const boost::optional<table_manager_bcard_t> &table_bcard,
+        const optional<table_manager_bcard_t> &table_bcard,
         /* This is the other server's global directory entry. If the other server is not
         connected, don't call `do_sync()`. */
         const multi_table_manager_bcard_t &table_manager_bcard);
@@ -338,17 +381,17 @@ private:
         * const connections_map;
     table_persistence_interface_t *persistence_interface;
 
-    boost::optional<base_path_t> base_path;
+    optional<base_path_t> base_path;
     io_backender_t *io_backender;
 
     perfmon_collection_repo_t *perfmon_collection_repo;
 
-    backfill_throttler_t backfill_throttler;
+    standard_backfill_throttler_t backfill_throttler;
 
     /* This collects the `table_basic_config_t` for every non-deleted table in the
     `tables` map, for the benefit of the `table_meta_client_t`. */
     watchable_map_var_t<namespace_id_t,
-            std::pair<table_basic_config_t, multi_table_manager_bcard_t::timestamp_t> >
+            std::pair<table_basic_config_t, multi_table_manager_timestamp_t> >
         table_basic_configs;
 
     /* This map describes the table business cards that we show to other servers via the
@@ -383,7 +426,7 @@ private:
             table_manager_directory_subs;
 
     scoped_ptr_t<multi_table_manager_bcard_t::action_mailbox_t> action_mailbox;
-    scoped_ptr_t<multi_table_manager_bcard_t::get_config_mailbox_t> get_config_mailbox;
+    scoped_ptr_t<multi_table_manager_bcard_t::get_status_mailbox_t> get_status_mailbox;
 };
 
 #endif /* CLUSTERING_TABLE_MANAGER_MULTI_TABLE_MANAGER_HPP_ */

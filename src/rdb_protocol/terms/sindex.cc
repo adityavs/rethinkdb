@@ -1,8 +1,9 @@
-// Copyright 2010-2013 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "rdb_protocol/terms/terms.hpp"
 
 #include <string>
 
+#include "clustering/administration/admin_op_exc.hpp"
 #include "containers/archive/string_stream.hpp"
 #include "rdb_protocol/real_table.hpp"
 #include "rdb_protocol/btree.hpp"
@@ -48,17 +49,36 @@ sindex_config_t sindex_config_from_string(
     rcheck_target(
         target,
         !bad_prefix,
-        base_exc_t::GENERIC,
+        base_exc_t::LOGIC,
         "Cannot create an sindex except from a reql_index_function returned from "
         "`index_status` in the field `function`.");
     std::vector<char> vec(data + prefix_sz, data + sz);
     sindex_disk_info_t sindex_info;
     try {
-        deserialize_sindex_info(vec, &sindex_info);
+        deserialize_sindex_info(vec, &sindex_info,
+            [target](obsolete_reql_version_t ver) {
+                switch (ver) {
+                case obsolete_reql_version_t::v1_13:
+                    rfail_target(target, base_exc_t::LOGIC,
+                                 "Attempted to import a RethinkDB 1.13 secondary index, "
+                                 "which is no longer supported.  This secondary index "
+                                 "may be updated by importing into RethinkDB 2.0.");
+                    break;
+                // v1_15 is equal to v1_14
+                case obsolete_reql_version_t::v1_14:
+                    rfail_target(target, base_exc_t::LOGIC,
+                                 "Attempted to import a secondary index from before "
+                                 "RethinkDB 1.16, which is no longer supported.  This "
+                                 "secondary index may be updated by importing into "
+                                 "RethinkDB 2.1.");
+                    break;
+                default: unreachable();
+                }
+            });
     } catch (const archive_exc_t &e) {
         rfail_target(
             target,
-            base_exc_t::GENERIC,
+            base_exc_t::LOGIC,
             "Binary blob passed to index create could not be interpreted as a "
             "reql_index_function (%s).",
             e.what());
@@ -68,6 +88,40 @@ sindex_config_t sindex_config_from_string(
         sindex_info.mapping_version_info.original_reql_version,
         sindex_info.multi,
         sindex_info.geo);
+}
+
+// Helper for `sindex_status_to_datum()`
+std::string format_index_create_query(
+        const std::string &name,
+        const sindex_config_t &config) {
+    // TODO: Theoretically we need to escape quotes and UTF-8 characters inside the name.
+    // Maybe use RapidJSON? Does our pretty-printer even do that for strings?
+    std::string ret = "indexCreate('" + name + "', ";
+    ret += config.func.compile_wire_func()->print_js_function();
+    bool first_optarg = true;
+    if (config.multi == sindex_multi_bool_t::MULTI) {
+        if (first_optarg) {
+            ret += ", {";
+            first_optarg = false;
+        } else {
+            ret += ", ";
+        }
+        ret += "multi: true";
+    }
+    if (config.geo == sindex_geo_bool_t::GEO) {
+        if (first_optarg) {
+            ret += ", {";
+            first_optarg = false;
+        } else {
+            ret += ", ";
+        }
+        ret += "geo: true";
+    }
+    if (!first_optarg) {
+        ret += "}";
+    }
+    ret += ")";
+    return ret;
 }
 
 /* `sindex_status_to_datum()` produces the documents that are returned from
@@ -80,10 +134,9 @@ ql::datum_t sindex_status_to_datum(
     ql::datum_object_builder_t stat;
     stat.overwrite("index", ql::datum_t(datum_string_t(name)));
     if (!status.ready) {
-        stat.overwrite("blocks_processed",
-            ql::datum_t(safe_to_double(status.blocks_processed)));
-        stat.overwrite("blocks_total",
-            ql::datum_t(safe_to_double(std::max<size_t>(status.blocks_total, 1))));
+        stat.overwrite("progress",
+            ql::datum_t(status.progress_numerator /
+                        std::max<double>(status.progress_denominator, 1.0)));
     }
     stat.overwrite("ready", ql::datum_t::boolean(status.ready));
     stat.overwrite("outdated", ql::datum_t::boolean(status.outdated));
@@ -93,22 +146,25 @@ ql::datum_t sindex_status_to_datum(
         ql::datum_t::boolean(config.geo == sindex_geo_bool_t::GEO));
     stat.overwrite("function",
         ql::datum_t::binary(sindex_config_to_string(config)));
+    stat.overwrite("query",
+        ql::datum_t(datum_string_t(format_index_create_query(name, config))));
     return std::move(stat).to_datum();
 }
 
 class sindex_create_term_t : public op_term_t {
 public:
-    sindex_create_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    sindex_create_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(2, 3), optargspec_t({"multi", "geo"})) { }
 
-    virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
+    virtual scoped_ptr_t<val_t> eval_impl(
+        scope_env_t *env, args_t *args, eval_flags_t) const {
         counted_t<table_t> table = args->arg(env, 0)->as_table();
         datum_t name_datum = args->arg(env, 1)->as_datum();
-        std::string name = name_datum.as_str().to_std();
-        rcheck(name != table->get_pkey(),
-               base_exc_t::GENERIC,
+        std::string index_name = name_datum.as_str().to_std();
+        rcheck(index_name != table->get_pkey(),
+               base_exc_t::LOGIC,
                strprintf("Index name conflict: `%s` is the name of the primary key.",
-                         name.c_str()));
+                         index_name.c_str()));
 
         /* Parse the sindex configuration */
         sindex_config_t config;
@@ -135,22 +191,21 @@ public:
                 config.func_version = reql_version_t::LATEST;
             }
         } else {
-
-            pb::dummy_var_t x = pb::dummy_var_t::SINDEXCREATE_X;
-            protob_t<Term> func_term
-                = r::fun(x, r::var(x)[name_datum]).release_counted();
-            propagate_backtrace(func_term.get(), backtrace());
+            minidriver_t r(backtrace());
+            auto x = minidriver_t::dummy_var_t::SINDEXCREATE_X;
 
             compile_env_t empty_compile_env((var_visibility_t()));
-            counted_t<func_term_t> func_term_term = make_counted<func_term_t>(
-                &empty_compile_env, func_term);
+            counted_t<func_term_t> func_term_term =
+                make_counted<func_term_t>(&empty_compile_env,
+                                          r.fun(x, r.var(x)[name_datum]).root_term());
 
             config.func = ql::map_wire_func_t(func_term_term->eval_to_func(env->scope));
             config.func_version = reql_version_t::LATEST;
         }
 
         config.func.compile_wire_func()->assert_deterministic(
-            "Index functions must be deterministic.");
+                constant_now_t::no,
+                "Index functions must be deterministic.");
 
         /* Check if we're doing a multi index or a normal index. */
         if (scoped_ptr_t<val_t> multi_val = args->optarg(env, "multi")) {
@@ -165,11 +220,20 @@ public:
                 : sindex_geo_bool_t::REGULAR;
         }
 
-        std::string error;
-        if (!env->env->reql_cluster_interface()->sindex_create(
-                table->db, name_string_t::guarantee_valid(table->name.c_str()),
-                name, config, env->env->interruptor, &error)) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+        try {
+            admin_err_t error;
+            if (!env->env->reql_cluster_interface()->sindex_create(
+                    env->env->get_user_context(),
+                    table->db,
+                    name_string_t::guarantee_valid(table->name.c_str()),
+                    index_name,
+                    config,
+                    env->env->interruptor,
+                    &error)) {
+                REQL_RETHROW(error);
+            }
+        } catch (auth::permission_error_t const &permission_error) {
+            rfail(ql::base_exc_t::PERMISSION_ERROR, "%s", permission_error.what());
         }
 
         ql::datum_object_builder_t res;
@@ -182,18 +246,26 @@ public:
 
 class sindex_drop_term_t : public op_term_t {
 public:
-    sindex_drop_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    sindex_drop_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(2)) { }
 
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
         counted_t<table_t> table = args->arg(env, 0)->as_table();
-        std::string name = args->arg(env, 1)->as_datum().as_str().to_std();
+        std::string index_name = args->arg(env, 1)->as_datum().as_str().to_std();
 
-        std::string error;
-        if (!env->env->reql_cluster_interface()->sindex_drop(
-                table->db, name_string_t::guarantee_valid(table->name.c_str()),
-                name, env->env->interruptor, &error)) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+        try {
+            admin_err_t error;
+            if (!env->env->reql_cluster_interface()->sindex_drop(
+                    env->env->get_user_context(),
+                    table->db,
+                    name_string_t::guarantee_valid(table->name.c_str()),
+                    index_name,
+                    env->env->interruptor,
+                    &error)) {
+                REQL_RETHROW(error);
+            }
+        } catch (auth::permission_error_t const &permission_error) {
+            rfail(ql::base_exc_t::PERMISSION_ERROR, "%s", permission_error.what());
         }
 
         ql::datum_object_builder_t res;
@@ -206,7 +278,7 @@ public:
 
 class sindex_list_term_t : public op_term_t {
 public:
-    sindex_list_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    sindex_list_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1)) { }
 
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -215,11 +287,11 @@ public:
         /* Fetch a list of all sindexes and their configs and statuses */
         std::map<std::string, std::pair<sindex_config_t, sindex_status_t> >
             configs_and_statuses;
-        std::string error;
+        admin_err_t error;
         if (!env->env->reql_cluster_interface()->sindex_list(
                 table->db, name_string_t::guarantee_valid(table->name.c_str()),
                 env->env->interruptor, &error, &configs_and_statuses)) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+            REQL_RETHROW(error);
         }
 
         /* Convert into an array and return it */
@@ -235,7 +307,7 @@ public:
 
 class sindex_status_term_t : public op_term_t {
 public:
-    sindex_status_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    sindex_status_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1, -1)) { }
 
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -249,21 +321,22 @@ public:
         /* Fetch a list of all sindexes and their configs and statuses */
         std::map<std::string, std::pair<sindex_config_t, sindex_status_t> >
             configs_and_statuses;
-        std::string error;
+        admin_err_t error;
         if (!env->env->reql_cluster_interface()->sindex_list(
                 table->db, name_string_t::guarantee_valid(table->name.c_str()),
                 env->env->interruptor, &error, &configs_and_statuses)) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+            REQL_RETHROW(error);
         }
 
         /* Convert it into an array and return it */
         ql::datum_array_builder_t res(ql::configured_limits_t::unlimited);
+        std::set<std::string> remaining_sindexes = sindexes;
         for (const auto &pair : configs_and_statuses) {
             if (!sindexes.empty()) {
                 if (sindexes.count(pair.first) == 0) {
                     continue;
                 } else {
-                    sindexes.erase(pair.first);
+                    remaining_sindexes.erase(pair.first);
                 }
             }
             res.add(sindex_status_to_datum(
@@ -271,9 +344,9 @@ public:
         }
 
         /* Make sure we found all the requested sindexes. */
-        rcheck(sindexes.empty(), base_exc_t::GENERIC,
+        rcheck(remaining_sindexes.empty(), base_exc_t::OP_FAILED,
             strprintf("Index `%s` was not found on table `%s`.",
-                      sindexes.begin()->c_str(),
+                      remaining_sindexes.begin()->c_str(),
                       table->display_name().c_str()));
 
         return new_val(std::move(res).to_datum());
@@ -288,7 +361,7 @@ int64_t max_poll_ms = 10000;
 
 class sindex_wait_term_t : public op_term_t {
 public:
-    sindex_wait_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    sindex_wait_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1, -1)) { }
 
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -303,11 +376,19 @@ public:
         for (;;) {
             std::map<std::string, std::pair<sindex_config_t, sindex_status_t> >
                 configs_and_statuses;
-            std::string error;
+            admin_err_t error;
             if (!env->env->reql_cluster_interface()->sindex_list(
                     table->db, name_string_t::guarantee_valid(table->name.c_str()),
                     env->env->interruptor, &error, &configs_and_statuses)) {
-                rfail(base_exc_t::GENERIC, "%s", error.c_str());
+                REQL_RETHROW(error);
+            }
+
+            // Verify all requested sindexes exist.
+            for (const auto &sindex : sindexes) {
+                rcheck(configs_and_statuses.count(sindex) == 1, base_exc_t::OP_FAILED,
+                    strprintf("Index `%s` was not found on table `%s`.",
+                              sindex.c_str(),
+                              table->display_name().c_str()));
             }
 
             ql::datum_array_builder_t statuses(ql::configured_limits_t::unlimited);
@@ -337,32 +418,43 @@ public:
 
 class sindex_rename_term_t : public op_term_t {
 public:
-    sindex_rename_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    sindex_rename_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(3, 3), optargspec_t({"overwrite"})) { }
 
-    virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
+    virtual scoped_ptr_t<val_t> eval_impl(
+        scope_env_t *env, args_t *args, eval_flags_t) const {
         counted_t<table_t> table = args->arg(env, 0)->as_table();
         scoped_ptr_t<val_t> old_name_val = args->arg(env, 1);
         scoped_ptr_t<val_t> new_name_val = args->arg(env, 2);
         std::string old_name = old_name_val->as_str().to_std();
         std::string new_name = new_name_val->as_str().to_std();
         rcheck(old_name != table->get_pkey(),
-               base_exc_t::GENERIC,
+               base_exc_t::LOGIC,
                strprintf("Index name conflict: `%s` is the name of the primary key.",
                          old_name.c_str()));
         rcheck(new_name != table->get_pkey(),
-               base_exc_t::GENERIC,
+               base_exc_t::LOGIC,
                strprintf("Index name conflict: `%s` is the name of the primary key.",
                          new_name.c_str()));
 
         scoped_ptr_t<val_t> overwrite_val = args->optarg(env, "overwrite");
         bool overwrite = overwrite_val ? overwrite_val->as_bool() : false;
 
-        std::string error;
-        if (!env->env->reql_cluster_interface()->sindex_rename(
-                table->db, name_string_t::guarantee_valid(table->name.c_str()),
-                old_name, new_name, overwrite, env->env->interruptor, &error)) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+        try {
+            admin_err_t error;
+            if (!env->env->reql_cluster_interface()->sindex_rename(
+                    env->env->get_user_context(),
+                    table->db,
+                    name_string_t::guarantee_valid(table->name.c_str()),
+                    old_name,
+                    new_name,
+                    overwrite,
+                    env->env->interruptor,
+                    &error)) {
+                REQL_RETHROW(error);
+            }
+        } catch (auth::permission_error_t const &permission_error) {
+            rfail(ql::base_exc_t::PERMISSION_ERROR, "%s", permission_error.what());
         }
 
         datum_object_builder_t retval;
@@ -376,27 +468,27 @@ public:
 };
 
 counted_t<term_t> make_sindex_create_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<sindex_create_term_t>(env, term);
 }
 counted_t<term_t> make_sindex_drop_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<sindex_drop_term_t>(env, term);
 }
 counted_t<term_t> make_sindex_list_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<sindex_list_term_t>(env, term);
 }
 counted_t<term_t> make_sindex_status_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<sindex_status_term_t>(env, term);
 }
 counted_t<term_t> make_sindex_wait_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<sindex_wait_term_t>(env, term);
 }
 counted_t<term_t> make_sindex_rename_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<sindex_rename_term_t>(env, term);
 }
 

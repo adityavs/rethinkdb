@@ -10,6 +10,8 @@
 #include "clustering/immediate_consistency/backfill_metadata.hpp"
 #include "store_view.hpp"
 
+class backfill_progress_tracker_t;
+
 /* `backfiller_t` is responsible for copying the given store's state to other servers via
 `backfillee_t`.
 
@@ -96,7 +98,7 @@ private:
         `item_throttler`, but its `count` changes to reflect the total mem size that's
         currently in the queue. */
         new_semaphore_t item_throttler;
-        new_semaphore_acq_t item_throttler_acq;
+        new_semaphore_in_line_t item_throttler_acq;
 
         scoped_ptr_t<session_t> current_session;
 

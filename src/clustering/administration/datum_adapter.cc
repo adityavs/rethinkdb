@@ -14,9 +14,11 @@ ql::datum_t convert_string_to_datum(
 bool convert_string_from_datum(
         const ql::datum_t &datum,
         std::string *value_out,
-        std::string *error_out) {
+        admin_err_t *error_out) {
     if (datum.get_type() != ql::datum_t::R_STR) {
-        *error_out = "Expected a string; got " + datum.print();
+        *error_out = admin_err_t{
+            "Expected a string; got " + datum.print(),
+            query_state_t::FAILED};
         return false;
     }
     *value_out = datum.as_str().to_std();
@@ -32,14 +34,18 @@ bool convert_name_from_datum(
         ql::datum_t datum,
         const std::string &what,
         name_string_t *value_out,
-        std::string *error_out) {
+        admin_err_t *error_out) {
     if (datum.get_type() != ql::datum_t::R_STR) {
-        *error_out = "Expected a " + what + "; got " + datum.print();
+        *error_out = admin_err_t{
+            "Expected a " + what + "; got " + datum.print(),
+            query_state_t::FAILED};
         return false;
     }
     if (!value_out->assign_value(datum.as_str())) {
-        *error_out = datum.print() + " is not a valid " + what + "; " +
-            std::string(name_string_t::valid_char_msg);
+        *error_out = admin_err_t{
+            datum.print() + " is not a valid " + what + "; "
+            + std::string(name_string_t::valid_char_msg),
+            query_state_t::FAILED};
         return false;
     }
     return true;
@@ -50,16 +56,44 @@ ql::datum_t convert_uuid_to_datum(
     return ql::datum_t(datum_string_t(uuid_to_str(value)));
 }
 
+ql::datum_t convert_server_id_to_datum(
+        const server_id_t &value) {
+    return ql::datum_t(datum_string_t(value.print()));
+}
+
 bool convert_uuid_from_datum(
         ql::datum_t datum,
         uuid_u *value_out,
-        std::string *error_out) {
+        admin_err_t *error_out) {
     if (datum.get_type() != ql::datum_t::R_STR) {
-        *error_out = "Expected a UUID; got " + datum.print();
+        *error_out = admin_err_t{
+            "Expected a UUID; got " + datum.print(),
+            query_state_t::FAILED};
         return false;
     }
     if (!str_to_uuid(datum.as_str().to_std(), value_out)) {
-        *error_out = "Expected a UUID; got " + datum.print();
+        *error_out = admin_err_t{
+            "Expected a UUID; got " + datum.print(),
+            query_state_t::FAILED};
+        return false;
+    }
+    return true;
+}
+
+bool convert_server_id_from_datum(
+        ql::datum_t datum,
+        server_id_t *value_out,
+        admin_err_t *error_out) {
+    if (datum.get_type() != ql::datum_t::R_STR) {
+        *error_out = admin_err_t{
+            "Expected a server ID; got " + datum.print(),
+            query_state_t::FAILED};
+        return false;
+    }
+    if (!str_to_server_id(datum.as_str().to_std(), value_out)) {
+        *error_out = admin_err_t{
+            "Expected a server ID; got " + datum.print(),
+            query_state_t::FAILED};
         return false;
     }
     return true;
@@ -76,25 +110,46 @@ ql::datum_t convert_name_or_uuid_to_datum(
     }
 }
 
+ql::datum_t convert_name_or_server_id_to_datum(
+        const name_string_t &name,
+        const server_id_t &sid,
+        admin_identifier_format_t identifier_format) {
+    if (identifier_format == admin_identifier_format_t::name) {
+        return convert_name_to_datum(name);
+    } else {
+        return convert_server_id_to_datum(sid);
+    }
+}
+
 bool convert_connected_server_id_to_datum(
         const server_id_t &server_id,
         admin_identifier_format_t identifier_format,
         server_config_client_t *server_config_client,
         ql::datum_t *server_name_or_uuid_out,
         name_string_t *server_name_out) {
-    boost::optional<name_string_t> name;
-    server_config_client->get_server_config_map()->read_key(server_id,
-        [&](const server_config_versioned_t *config) {
-            if (config != nullptr) {
-                name = boost::make_optional(config->config.name);
-            }
-        });
-    if (!static_cast<bool>(name)) {
-        return false;
+    optional<name_string_t> name;
+    if (server_id.is_proxy()) {
+        // Fill in a temporary proxy server name.
+        // We assume that proxies only appear anywhere if they are currently
+        // connected, so we don't need a separate check for connectedness.
+        name.set(name_string_t::guarantee_valid(server_id.print().c_str()));
+    } else {
+        server_config_client->get_server_config_map()->read_key(server_id,
+            [&](const server_config_versioned_t *config) {
+                if (config != nullptr) {
+                    name = make_optional(config->config.name);
+                }
+            });
+        if (!static_cast<bool>(name)) {
+            // No entry in the server config map means that the server is not
+            // currently connected.
+            return false;
+        }
     }
+
     if (server_name_or_uuid_out != nullptr) {
-        *server_name_or_uuid_out =
-            convert_name_or_uuid_to_datum(*name, server_id, identifier_format);
+        *server_name_or_uuid_out = convert_name_or_uuid_to_datum(
+                *name, server_id.get_uuid(), identifier_format);
     }
     if (server_name_out != nullptr) *server_name_out = *name;
     return true;
@@ -162,7 +217,7 @@ bool convert_database_id_from_datum(
         const cluster_semilattice_metadata_t &metadata,
         database_id_t *db_id_out,
         name_string_t *db_name_out,
-        std::string *error_out) {
+        admin_err_t *error_out) {
     if (identifier_format == admin_identifier_format_t::name) {
         name_string_t name;
         if (!convert_name_from_datum(db_name_or_uuid, "database name",
@@ -183,8 +238,10 @@ bool convert_database_id_from_datum(
         }
         auto it = metadata.databases.databases.find(db_id);
         if (it == metadata.databases.databases.end() || it->second.is_deleted()) {
-            *error_out = strprintf("There is no database with UUID `%s`.",
-                uuid_to_str(db_id).c_str());
+            *error_out = admin_err_t{
+                strprintf("There is no database with UUID `%s`.",
+                          uuid_to_str(db_id).c_str()),
+                query_state_t::FAILED};
             return false;
         }
         if (db_id_out != nullptr) *db_id_out = db_id;
@@ -205,9 +262,11 @@ ql::datum_t convert_microtime_to_datum(
 
 bool converter_from_datum_object_t::init(
         ql::datum_t _datum,
-        std::string *error_out) {
+        admin_err_t *error_out) {
     if (_datum.get_type() != ql::datum_t::R_OBJECT) {
-        *error_out = "Expected an object; got " + _datum.print();
+        *error_out = admin_err_t{
+            "Expected an object; got " + _datum.print(),
+            query_state_t::FAILED};
         return false;
     }
     datum = _datum;
@@ -221,11 +280,13 @@ bool converter_from_datum_object_t::init(
 bool converter_from_datum_object_t::get(
         const char *key,
         ql::datum_t *value_out,
-        std::string *error_out) {
+        admin_err_t *error_out) {
     extra_keys.erase(datum_string_t(key));
     *value_out = datum.get_field(key, ql::NOTHROW);
     if (!value_out->has()) {
-        *error_out = strprintf("Expected a field named `%s`.", key);
+        *error_out = admin_err_t{
+            strprintf("Expected a field named `%s`.", key),
+            query_state_t::FAILED};
         return false;
     }
     return true;
@@ -242,11 +303,11 @@ bool converter_from_datum_object_t::has(const char *key) {
     return datum.get_field(key, ql::NOTHROW).has();
 }
 
-bool converter_from_datum_object_t::check_no_extra_keys(std::string *error_out) {
+bool converter_from_datum_object_t::check_no_extra_keys(admin_err_t *error_out) {
     if (!extra_keys.empty()) {
-        *error_out = "Unexpected key(s):";
+        *error_out = admin_err_t{"Unexpected key(s):", query_state_t::FAILED};
         for (const datum_string_t &key : extra_keys) {
-            (*error_out) += " " + key.to_std();
+            error_out->msg += " " + key.to_std();
         }
         return false;
     }

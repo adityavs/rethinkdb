@@ -68,7 +68,7 @@ public:
               &pm_total_keys_read, "total_keys_read",
               &pm_keys_set, "keys_set",
               &pm_total_keys_set, "total_keys_set") {
-        if (parent != NULL) {
+        if (parent != nullptr) {
             rename(parent, identifier);
         }
     }
@@ -100,7 +100,7 @@ public:
 class keyvalue_location_t {
 public:
     keyvalue_location_t()
-        : superblock(NULL), pass_back_superblock(NULL),
+        : superblock(nullptr), pass_back_superblock(nullptr),
           there_originally_was_value(false), stat_block(NULL_BLOCK_ID) { }
 
     ~keyvalue_location_t() {
@@ -203,7 +203,7 @@ void find_keyvalue_location_for_write(
         const value_deleter_t *balancing_detacher,
         keyvalue_location_t *keyvalue_location_out,
         profile::trace_t *trace,
-        promise_t<superblock_t *> *pass_back_superblock = NULL) THROWS_NOTHING;
+        promise_t<superblock_t *> *pass_back_superblock = nullptr) THROWS_NOTHING;
 
 void find_keyvalue_location_for_read(
         value_sizer_t *sizer,
@@ -213,22 +213,29 @@ void find_keyvalue_location_for_read(
         btree_stats_t *stats,
         profile::trace_t *trace);
 
-/* Specifies whether `apply_keyvalue_change` should delete or erase a value.
-The difference is that deleting a value updates the node's replication timestamp
-and creates a deletion entry in the leaf. This means that the deletion is going
-to be backfilled.
-An erase on the other hand just removes the keyvalue from the leaf node, as if
-it had never existed.
-If the change is the result of a ReQL query, you'll almost certainly want DELETE
-and not ERASE. */
-enum class delete_or_erase_t { DELETE, ERASE };
+/* `delete_mode_t` controls how `apply_keyvalue_change()` acts when `kv_loc->value` is
+empty. */
+enum class delete_mode_t {
+    /* If there was a value before, remove it and add a tombstone. (If `tstamp` is less
+    than the cutpoint, no tombstone will be added.) Otherwise, do nothing. This mode is
+    used for regular delete queries. */
+    REGULAR_QUERY,
+    /* If there was a value or tombstone before, remove it. This mode is used for erasing
+    ranges of the database (e.g. during resharding) and also sometimes in backfilling. */
+    ERASE,
+    /* If there was a value or tombstone before, remove it. Then add a tombstone,
+    regardless of what was present before, unless `tstamp` is less than the cutpoint.
+    This mode is used for transferring tombstones from other servers in backfilling. */
+    MAKE_TOMBSTONE
+};
 
 void apply_keyvalue_change(
         value_sizer_t *sizer,
         keyvalue_location_t *kv_loc,
-        const btree_key_t *key, repli_timestamp_t tstamp,
+        const btree_key_t *key,
+        repli_timestamp_t tstamp,
         const value_deleter_t *balancing_detacher,
         key_modification_callback_t *km_callback,
-        delete_or_erase_t delete_or_erase = delete_or_erase_t::DELETE);
+        delete_mode_t delete_mode);
 
 #endif  // BTREE_OPERATIONS_HPP_

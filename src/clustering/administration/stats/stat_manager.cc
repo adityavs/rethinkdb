@@ -32,7 +32,7 @@ void stat_manager_t::on_stats_request(
 
     // Add in our own server id so the other side does not need to perform lookups
     ql::datum_object_builder_t stats(perfmon_result);
-    stats.overwrite("server_id", convert_uuid_to_datum(own_server_id));
+    stats.overwrite("server_id", convert_uuid_to_datum(own_server_id.get_uuid()));
     send(mailbox_manager, reply_address, std::move(stats).to_datum());
 }
 
@@ -42,9 +42,9 @@ bool fetch_stats_from_server(
         const std::set<std::vector<stat_manager_t::stat_id_t> > &filter,
         signal_t *interruptor,
         ql::datum_t *stats_out,
-        std::string *error_out) {
+        admin_err_t *error_out) {
     cond_t done;
-    mailbox_t<void(ql::datum_t)> return_mailbox(mailbox_manager,
+    mailbox_t<ql::datum_t> return_mailbox(mailbox_manager,
         [&](signal_t *, ql::datum_t s) {
             *stats_out = s;
             done.pulse();
@@ -61,12 +61,12 @@ bool fetch_stats_from_server(
     wait_interruptible(&waiter, interruptor);
 
     if (disconnect_watcher.is_pulsed()) {
-        *error_out = "Server disconnected.";
+        *error_out = admin_err_t{"Server disconnected.", query_state_t::FAILED};
         return false;
     }
 
     if (timeout.is_pulsed()) {
-        *error_out = "Stats request timed out.";
+        *error_out = admin_err_t{"Stats request timed out.", query_state_t::FAILED};
         return false;
     }
 

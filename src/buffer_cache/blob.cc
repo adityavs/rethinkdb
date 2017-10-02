@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 
+#include <algorithm>
 #include <limits>
 
 #include "buffer_cache/alt.hpp"
@@ -11,6 +12,7 @@
 #include "containers/scoped.hpp"
 #include "math.hpp"
 #include "serializer/types.hpp"
+#include "utils.hpp"
 
 // The maximal number of blocks to traverse concurrently.
 // Roughly equivalent to the maximal number of coroutines that loading a blob
@@ -460,7 +462,7 @@ void expose_tree_from_block_ids(buf_parent_t parent, access_t mode,
                 // intricate logic), because immediately after creation, the blob has
                 // size max_value_size, but after we've written to the block, its
                 // size could be shrunken.
-                uint32_t block_size;
+                uint16_t block_size;
                 leaf_buf = const_cast<void *>(buf_read->get_data_read(&block_size));
                 acq_group_out->add_buf(buf, buf_read);
             } else {
@@ -655,7 +657,7 @@ bool blob_t::traverse_to_dimensions(buf_parent_t parent, int levels,
 struct allocate_helper_t : public blob::traverse_helper_t {
     buf_lock_t preprocess(buf_parent_t parent, int levels,
                           block_id_t *block_id) {
-        buf_lock_t temp_lock(parent, alt_create_t::create);
+        buf_lock_t temp_lock(parent, alt_create_t::create, block_type_t::aux);
         *block_id = temp_lock.block_id();
         {
             buf_write_t lock_write(&temp_lock);
@@ -685,6 +687,9 @@ struct deallocate_helper_t : public blob::traverse_helper_t {
     }
 
     void postprocess(buf_lock_t *lock) {
+        // mark_deleted() requires that we have already got the write lock.
+        // Make sure that's the case before we call it...
+        lock->write_acq_signal()->wait_lazily_unordered();
         lock->mark_deleted();
     }
 };
@@ -705,7 +710,7 @@ void blob_t::deallocate_to_dimensions(buf_parent_t parent, int levels,
 
 // Always returns levels + 1.
 int blob_t::add_level(buf_parent_t parent, int levels) {
-    buf_lock_t lock(parent, alt_create_t::create);
+    buf_lock_t lock(parent, alt_create_t::create, block_type_t::aux);
     buf_write_t lock_write(&lock);
     void *b = lock_write.get_data_write();
     if (levels == 0) {
@@ -757,7 +762,7 @@ bool blob_t::remove_level(buf_parent_t parent, int *levels_ref) {
                         access_t::write);
         if (levels == 1) {
             buf_read_t lock_read(&lock);
-            uint32_t unused_block_size;
+            uint16_t unused_block_size;
             const char *b = blob::leaf_node_data(lock_read.get_data_read(&unused_block_size));
             char *small = blob::small_buffer(ref_, maxreflen_);
             memcpy(small, b, bigsize);
@@ -773,6 +778,9 @@ bool blob_t::remove_level(buf_parent_t parent, int *levels_ref) {
                                               0, bigsize,
                                               &lo, &hi);
 
+            // We must overwrite at least the first block ID, or we might end up
+            // processing it a second time when `remove_level` gets called again.
+            guarantee(lo == 0 && hi > 0);
 
             block_id_t *block_ids = blob::block_ids(ref_, maxreflen_);
             for (int i = lo; i < hi; ++i) {
@@ -781,6 +789,7 @@ bool blob_t::remove_level(buf_parent_t parent, int *levels_ref) {
             }
         }
 
+        lock.write_acq_signal()->wait_lazily_unordered();
         lock.mark_deleted();
     }
 

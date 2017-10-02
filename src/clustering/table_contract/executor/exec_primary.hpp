@@ -45,13 +45,11 @@ class primary_execution_t :
 public:
     primary_execution_t(
         const execution_t::context_t *context,
-        store_view_t *store,
-        perfmon_collection_t *perfmon_collection,
-        const std::function<void(
-            const contract_id_t &, const contract_ack_t &)> &ack_cb,
+        execution_t::params_t *params,
         const contract_id_t &cid,
         const table_raft_state_t &raft_state);
     ~primary_execution_t();
+
     void update_contract_or_raft_state(
         const contract_id_t &cid,
         const table_raft_state_t &raft_state);
@@ -99,14 +97,14 @@ private:
         order_token_t order_token,
         signal_t *interruptor,
         write_response_t *response_out,
-        std::string *error_out);
+        admin_err_t *error_out);
     bool on_read(
         const read_t &request,
         fifo_enforcer_sink_t::exit_read_t *exiter,
         order_token_t order_token,
         signal_t *interruptor,
         read_response_t *response_out,
-        std::string *error_out);
+        admin_err_t *error_out);
 
     /* `sync_majority()` is used after a read in 'majority' mode, and will perform a
     `sync` operation across a majority of replicas to make sure what has just been read
@@ -114,7 +112,7 @@ private:
     bool sync_committed_read(const read_t &read_request,
                              order_token_t order_token,
                              signal_t *interruptor,
-                             std::string *error_out);
+                             admin_err_t *error_out);
 
     /* `update_contract_or_raft_state()` spawns `update_contract_on_store_thread()`
     to deliver the new contract to `store->home_thread()`. It has two jobs:
@@ -143,7 +141,13 @@ private:
         counted_t<contract_info_t> contract,
         const std::set<server_id_t> &servers);
 
-    boost::optional<branch_id_t> our_branch_id;
+    /* `is_majority_available()` is a helper function to determine whether a majority
+    of the replicas are available to acknowledge a read or write. */
+    static bool is_majority_available(
+        counted_t<contract_info_t> contract,
+        primary_dispatcher_t *dispatcher);
+
+    optional<branch_id_t> our_branch_id;
 
     /* `latest_contract_*` stores the latest contract we've received, along with its ack
     callback. The `home_thread` version should only be accessed on `this->home_thread()`,
@@ -151,7 +155,7 @@ private:
     counted_t<contract_info_t> latest_contract_home_thread, latest_contract_store_thread;
 
     /* `latest_ack` stores the latest contract ack we've sent. */
-    boost::optional<contract_ack_t> latest_ack;
+    optional<contract_ack_t> latest_ack;
 
     /* `update_contract_mutex` is used to order calls to
     `update_contract_on_store_thread()`, so that we don't overwrite a newer contract with
@@ -173,9 +177,9 @@ private:
     `our_dispatcher_drainer` will always both be null or both be non-null. */
     auto_drainer_t *our_dispatcher_drainer;
 
-    /* `begin_write_mutex` is used to ensure that we don't ack a contract until all past
-    and ongoing writes are safe under the contract's conditions. */
-    mutex_assertion_t begin_write_mutex;
+    /* `begin_write_mutex_assertion` is used to ensure that we don't ack a contract until
+    all past and ongoing writes are safe under the contract's conditions. */
+    mutex_assertion_t begin_write_mutex_assertion;
 
     /* `drainer` ensures that `run()` and `update_contract_on_store_thread()` are
     stopped before the other member variables are destroyed. */

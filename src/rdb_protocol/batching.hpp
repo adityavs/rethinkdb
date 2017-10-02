@@ -4,8 +4,10 @@
 
 #include <utility>
 
+#include "btree/keys.hpp"
 #include "containers/archive/archive.hpp"
 #include "containers/archive/versioned.hpp"
+#include "containers/optional.hpp"
 #include "rdb_protocol/datum.hpp"
 #include "rpc/serialize_macros.hpp"
 #include "time.hpp"
@@ -56,21 +58,23 @@ public:
         els_left(std::move(other.els_left)),
         size_left(std::move(other.size_left)),
         end_time(std::move(other.end_time)) { }
-    microtime_t microtime_left() {
-        microtime_t cur_time = current_microtime();
-        return end_time > cur_time ? end_time - cur_time : 0;
+    kiloticks_t kiloticks_left() {
+        kiloticks_t cur_time = get_kiloticks();
+        return kiloticks_t{end_time.micros > cur_time.micros ?
+                end_time.micros - cur_time.micros :
+                0};
     }
     batch_type_t get_batch_type() { return batch_type; }
 private:
     DISABLE_COPYING(batcher_t);
     friend class batchspec_t;
     batcher_t(batch_type_t batch_type, int64_t min_els, int64_t max_els,
-              int64_t max_size, microtime_t end_time);
+              int64_t max_size, kiloticks_t end_time);
 
     const batch_type_t batch_type;
     bool seen_one_el;
     int64_t min_els_left, els_left, size_left;
-    const microtime_t end_time;
+    const kiloticks_t end_time;
 };
 
 class batchspec_t {
@@ -81,8 +85,19 @@ public:
     static batchspec_t default_for(batch_type_t batch_type);
     batch_type_t get_batch_type() const { return batch_type; }
     batchspec_t with_new_batch_type(batch_type_t new_batch_type) const;
-    batchspec_t with_max_dur(int64_t new_max_dur) const;
+    batchspec_t with_min_els(int64_t new_min_els) const;
+    batchspec_t with_max_dur(kiloticks_t new_max_dur) const;
     batchspec_t with_at_most(uint64_t max_els) const;
+
+    // These are used to allow batchspecs to override the default ordering on a
+    // stream.  This is only really useful when a stream is being treated as a
+    // set, as in the case of `include_initial` changefeeds where always using
+    // `ASCENDING` ordering allows the logic to be simpler.
+    batchspec_t with_lazy_sorting_override(sorting_t sort) const;
+    sorting_t lazy_sorting(sorting_t base) const {
+        return lazy_sorting_override.value_or(base);
+    }
+
     batchspec_t scale_down(int64_t divisor) const;
     batcher_t to_batcher() const;
 
@@ -92,7 +107,7 @@ private:
     batchspec_t() { } // USE ONLY FOR SERIALIZATION
     batchspec_t(batch_type_t batch_type, int64_t min_els, int64_t max_els,
                 int64_t max_size, int64_t first_scaledown,
-                int64_t max_dur, microtime_t start_time);
+                kiloticks_t max_dur, kiloticks_t start_time);
 
     template<cluster_version_t W>
     friend void serialize(write_message_t *wm, const batchspec_t &batchspec);
@@ -100,8 +115,10 @@ private:
     friend archive_result_t deserialize(read_stream_t *s, batchspec_t *batchspec);
 
     batch_type_t batch_type;
-    int64_t min_els, max_els, max_size, first_scaledown_factor, max_dur;
-    microtime_t start_time;
+    int64_t min_els, max_els, max_size, first_scaledown_factor;
+    kiloticks_t max_dur;
+    kiloticks_t start_time;
+    optional<sorting_t> lazy_sorting_override;
 };
 RDB_DECLARE_SERIALIZABLE(batchspec_t);
 
