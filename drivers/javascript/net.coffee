@@ -94,12 +94,12 @@ aropt = util.aropt
 mkAtom = util.mkAtom
 mkErr = util.mkErr
 
-# These are the default hostname and port used by RethinkDB
-DEFAULT_HOST = 'localhost'
-DEFAULT_PORT = 28015
-
-module.exports.DEFAULT_HOST = DEFAULT_HOST
-module.exports.DEFAULT_PORT = DEFAULT_PORT
+# These are the default hostname and port used by RethinkDB.
+# Set the default hostname and port on the exported constants, to
+# keep backward compatibility when somebody would like to override
+# the default port or host name.
+module.exports.DEFAULT_HOST = 'localhost'
+module.exports.DEFAULT_PORT = 28015
 
 # These are strings returned by the server after a handshake
 # request. Since they must match exactly they're defined in
@@ -149,8 +149,8 @@ class Connection extends events.EventEmitter
             host = {host: host}
 
         # Here we set all of the connection parameters to their defaults.
-        @host = host.host || DEFAULT_HOST
-        @port = host.port || DEFAULT_PORT
+        @host = host.host || exports.DEFAULT_HOST
+        @port = host.port || exports.DEFAULT_PORT
 
         # One notable exception to defaulting is the db name. If the
         # user doesn't specify it, we leave it undefined. On the
@@ -1630,11 +1630,14 @@ module.exports.connect = varar 0, 2, (hostOrCallback, callback) ->
         # and set host to an empty object
         host = {}
         callback = hostOrCallback
-    else
+    else if typeof hostOrCallback is 'string'
         # Otherwise, the `callback` variable is already correctly
         # holding the callback, and the host variable is the first
-        # argument
-        host = hostOrCallback || {}
+        # argument -- either a string or an object.
+        host = hostOrCallback
+    else
+        # Copy the object so that we feel free to modify it.
+        host = Object.assign {}, hostOrCallback
 
     # `r.connect` returns a Promise which does the following:
     #

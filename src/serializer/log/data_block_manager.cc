@@ -736,17 +736,22 @@ buf_ptr_t data_block_manager_t::read(int64_t off_in, block_size_t block_size,
     }
 }
 
+// Sets maybe_checksum_out if one was computed, or sets it to zero otherwise.
 std::vector<counted_t<block_token_t>>
-data_block_manager_t::many_writes(const std::vector<buf_write_info_t> &writes,
+data_block_manager_t::many_writes(const buf_write_info_t *writes,
+                                  size_t writes_count,
                                   file_account_t *io_account,
                                   iocallback_t *cb) {
     // These tokens are grouped by extent.  You can do a contiguous write in each
     // extent.
+    uint64_t cumulative_aligned_size;
     std::vector<std::vector<counted_t<block_token_t>>> token_groups
-        = gimme_some_new_offsets(writes);
+        = gimme_some_new_offsets(writes, writes_count, &cumulative_aligned_size);
+    const bool wants_checksum
+        = cumulative_aligned_size <= serializer->dynamic_config.checksum_threshold;
 
-    for (auto it = writes.begin(); it != writes.end(); ++it) {
-        it->buf->ser_header.block_id = it->block_id;
+    for (size_t i = 0; i < writes_count; ++i) {
+        writes[i].buf->ser_header.block_id = writes[i].block_id;
     }
 
     struct intermediate_cb_t : public iocallback_t {
@@ -770,24 +775,24 @@ data_block_manager_t::many_writes(const std::vector<buf_write_info_t> &writes,
     intermediate_cb->cb = cb;
 
     size_t write_number = 0;
-    for (size_t i = 0; i < token_groups.size(); ++i) {
-
-        const int64_t front_offset = token_groups[i].front()->offset();
-        const int64_t back_offset = token_groups[i].back()->offset()
-            + gc_entry_t::aligned_value(token_groups[i].back()->block_size());
+    for (const std::vector<counted_t<block_token_t>> &group : token_groups) {
+        const int64_t front_offset = group.front()->offset();
+        const int64_t back_offset = group.back()->offset()
+            + gc_entry_t::aligned_value(group.back()->block_size());
 
         guarantee(divides(DEVICE_BLOCK_SIZE, front_offset));
 
         const int64_t write_size = back_offset - front_offset;
 
-        scoped_array_t<iovec> iovecs(token_groups[i].size());
+        scoped_array_t<iovec> iovecs(group.size());
 
         int64_t last_written_offset = front_offset;
         size_t total_aligned_size = 0;
 
-        for (size_t j = 0; j < token_groups[i].size(); ++j) {
-            const int64_t j_offset = token_groups[i][j]->offset();
-            const block_size_t j_block_size = token_groups[i][j]->block_size();
+        for (size_t j = 0, je = group.size(); j < je; ++j) {
+            block_token_t *token = group[j].get();
+            const int64_t j_offset = token->offset();
+            const block_size_t j_block_size = token->block_size();
             guarantee(j_offset == last_written_offset);
             const size_t j_aligned_size = gc_entry_t::aligned_value(j_block_size);
             total_aligned_size += j_aligned_size;
@@ -796,7 +801,14 @@ data_block_manager_t::many_writes(const std::vector<buf_write_info_t> &writes,
             // we expect writes[write_number] to have the currently-relevant write.
             guarantee(writes[write_number].block_size == j_block_size);
 
-            iovecs[j].iov_base = writes[write_number].buf;
+            void *buf = writes[write_number].buf;
+            if (wants_checksum) {
+                size_t wordcount = j_aligned_size / serializer_checksum::word_size;
+                serializer_checksum chksum = compute_checksum(buf, wordcount);
+                token->checksum_ = chksum;
+            }
+
+            iovecs[j].iov_base = buf;
             iovecs[j].iov_len = j_aligned_size;
             last_written_offset = j_offset + j_aligned_size;
 
@@ -816,10 +828,10 @@ data_block_manager_t::many_writes(const std::vector<buf_write_info_t> &writes,
     intermediate_cb->on_io_complete();
 
     std::vector<counted_t<block_token_t>> ret;
-    ret.reserve(writes.size());
-    for (auto it = token_groups.begin(); it != token_groups.end(); ++it) {
-        for (auto jt = it->begin(); jt != it->end(); ++jt) {
-            ret.push_back(std::move(*jt));
+    ret.reserve(writes_count);
+    for (std::vector<counted_t<block_token_t>> &group : token_groups) {
+        for (counted_t<block_token_t> &token : group) {
+            ret.push_back(std::move(token));
         }
     }
 
@@ -1259,7 +1271,8 @@ void data_block_manager_t::write_gcs(
                                                   writes[i].buf->ser_header.block_id));
         }
 
-        new_block_tokens = many_writes(the_writes, choose_gc_io_account(),
+        new_block_tokens = many_writes(the_writes.data(), the_writes.size(),
+                                       choose_gc_io_account(),
                                        &block_write_cond);
 
         guarantee(new_block_tokens.size() == writes.size());
@@ -1429,8 +1442,12 @@ void data_block_manager_t::actually_shutdown() {
     }
 }
 
+// Outputs how many bytes would get written, so we can use that info to decide later
+// whether to checksum the blocks (which'll let us save an fdatasync)
 std::vector<std::vector<counted_t<block_token_t>>>
-data_block_manager_t::gimme_some_new_offsets(const std::vector<buf_write_info_t> &writes) {
+data_block_manager_t::gimme_some_new_offsets(const buf_write_info_t *writes,
+                                             size_t writes_count,
+                                             uint64_t *cumulative_aligned_size_out) {
     ASSERT_NO_CORO_WAITING;
 
     // Start a new extent if necessary.
@@ -1443,12 +1460,15 @@ data_block_manager_t::gimme_some_new_offsets(const std::vector<buf_write_info_t>
     guarantee(active_extent->state == gc_entry_t::state_active);
 
     std::vector<std::vector<counted_t<block_token_t>>> ret;
+    uint64_t cumulative_aligned_size = 0;
 
-    std::vector<counted_t<block_token_t>> tokens;
-    for (auto it = writes.begin(); it != writes.end(); ++it) {
+    std::vector<counted_t<block_token_t> > tokens;
+    for (size_t i = 0; i < writes_count; ++i) {
+        block_size_t block_size = writes[i].block_size;
         uint32_t relative_offset = valgrind_undefined<uint32_t>(UINT32_MAX);
         unsigned int block_index = valgrind_undefined<unsigned int>(UINT_MAX);
-        if (!active_extent->new_offset(it->block_size,
+        cumulative_aligned_size += gc_entry_t::aligned_value(block_size);
+        if (!active_extent->new_offset(block_size,
                                        &relative_offset, &block_index)) {
             // Move the active_extent gc_entry_t to the young extent queue (if it's
             // not already empty), and make a new gc_entry_t.
@@ -1465,7 +1485,7 @@ data_block_manager_t::gimme_some_new_offsets(const std::vector<buf_write_info_t>
             }
 
             ++stats->pm_serializer_data_extents_allocated;
-            const bool succeeded = active_extent->new_offset(it->block_size,
+            const bool succeeded = active_extent->new_offset(block_size,
                                                              &relative_offset,
                                                              &block_index);
             guarantee(succeeded);
@@ -1482,13 +1502,14 @@ data_block_manager_t::gimme_some_new_offsets(const std::vector<buf_write_info_t>
         active_extent->was_written = true;
         active_extent->mark_live_tokenwise(block_index);
 
-        tokens.push_back(serializer->generate_block_token(offset, it->block_size));
+        tokens.push_back(serializer->generate_block_token(offset, block_size));
     }
 
     if (!tokens.empty()) {
         ret.push_back(std::move(tokens));
     }
 
+    *cumulative_aligned_size_out = cumulative_aligned_size;
     return ret;
 }
 

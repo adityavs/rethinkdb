@@ -99,9 +99,6 @@
 // TODO: make this dynamic where possible
 #define MAX_THREADS                               128
 
-// Ticks (in milliseconds) the internal timed tasks are performed at
-#define TIMER_TICKS_IN_MS                         5
-
 // How many times the page replacement algorithm tries to find an eligible page before giving up.
 // Note that (MAX_UNSAVED_DATA_LIMIT_FRACTION ** PAGE_REPL_NUM_TRIES) is the probability that the
 // page replacement algorithm will succeed on a given try, and if that probability is less than 1/2
@@ -144,7 +141,14 @@
 // block infos.
 #define LBA_RECONSTRUCTION_BATCH_SIZE             1024
 
+#if defined (__powerpc64__)
+// getifaddrs() calls alloca() and it tries to allocate 64KB of memory
+// in stack frame. To avoid stack overflow, increasing the stack size
+// to accomodate both alloca() and regsiter save area during context switch.
+#define COROUTINE_STACK_SIZE                      262144
+#else
 #define COROUTINE_STACK_SIZE                      131072
+#endif
 
 
 /**
